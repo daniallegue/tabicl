@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 from torch.multiprocessing import set_start_method
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.cuda.amp import GradScaler
 
 from tqdm import tqdm
 import wandb
@@ -31,7 +32,6 @@ warnings.filterwarnings(
     "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
 )
 
-
 class Timer:
     """Context manager for timing code execution."""
 
@@ -43,6 +43,52 @@ class Timer:
         self.elapsed = timeit.default_timer() - self.start_time
         return False  # Don't suppress exceptions
 
+@torch.no_grad()
+def log_moe_metrics(model, step: int, moip_ids: torch.Tensor | None = None):
+    """
+    Logs MoE expert observability metrics to wandb.
+
+    Assumes:
+      - model is TabICL or DDP(TabICL)
+      - ICLearning exposes get_moe_blocks()
+    """
+
+    # Handle DDP
+    raw_model = model.module if isinstance(model, DDP) else model
+
+    if not hasattr(raw_model, "get_moe_blocks"):
+        return
+
+    for layer_id, moe in enumerate(raw_model.get_moe_blocks()):
+        if moe.last_gate_weights is None:
+            continue
+
+        gw = moe.last_gate_weights        # (B, E)
+        B, E = gw.shape
+
+        entropy = -(gw * (gw + 1e-9).log()).sum(dim=-1).mean()
+
+        wandb.log(
+            {f"moe/layer_{layer_id}/entropy": entropy.item()},
+            step=step,
+        )
+
+        token_mass = gw.sum(dim=0)
+        token_mass = token_mass / token_mass.sum()
+
+        for e in range(E):
+            wandb.log(
+                {f"moe/layer_{layer_id}/expert_{e}_token_frac": token_mass[e].item()},
+                step=step,
+            )
+
+        for e in range(E):
+            wandb.log(
+                {f"moe/layer_{layer_id}/expert_{e}_grad_norm": moe.expert_grad_norms[e].item()},
+                step=step,
+            )
+
+        moe.reset_expert_grad_stats()
 
 def ddp_cleanup(func):
     """Decorator to clean up DDP process group after method execution.
@@ -184,6 +230,11 @@ class Trainer:
             "dropout": self.config.dropout,
             "activation": self.config.activation,
             "norm_first": self.config.norm_first,
+            "use_moe_icl": self.config.use_moe_icl,
+            "moe_num_experts": self.config.moe_num_experts,
+            "moe_hidden_mult": self.config.moe_hidden_mult,
+            "moe_num_priors": self.config.moe_num_priors,
+            "moe_use_moip": self.config.moe_use_moip,
         }
 
         model = TabICL(**self.model_config)
@@ -286,7 +337,7 @@ class Trainer:
         """Configure automatic mixed precision (AMP) for training."""
 
         self.amp = self.config.amp and "cuda" in self.config.device
-        self.scaler = torch.GradScaler("cuda", enabled=self.amp)
+        self.scaler = GradScaler(enabled=self.amp)
         if self.amp:
             if self.master_process:
                 print(f"Automatic Mixed Precision is enabled.")
@@ -339,15 +390,52 @@ class Trainer:
             return
 
         print(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.config.device, weights_only=True)
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=self.config.device,
+            weights_only=True,
+        )
 
-        # Load model state
         if "state_dict" not in checkpoint:
             raise ValueError("Checkpoint does not contain model state")
 
-        self.raw_model.load_state_dict(checkpoint["state_dict"])
+        missing, unexpected = self.raw_model.load_state_dict(
+            checkpoint["state_dict"],
+            strict=False,
+        )
 
-        # Optionally load optimizer and scheduler state
+        if self.master_process:
+            print(f"[Checkpoint] Missing keys: {len(missing)}")
+            print(f"[Checkpoint] Unexpected keys: {len(unexpected)}")
+
+        ckpt_state = checkpoint["state_dict"]
+
+        def checkpoint_has_moe(state_dict):
+            return any(
+                ("moe_block.experts" in k) or ("moe_block.gate" in k)
+                for k in state_dict.keys()
+            )
+
+        has_moe_in_ckpt = checkpoint_has_moe(ckpt_state)
+
+        if self.config.use_moe_icl and not has_moe_in_ckpt:
+            if self.master_process:
+                print("[MoE] No MoE weights in checkpoint → initializing from FFN")
+
+            icl = self.raw_model.icl_predictor
+
+            last_block = icl.tf_icl.blocks[-1]
+
+            lin1 = last_block.linear1
+            lin2 = last_block.linear2
+
+            for moe in icl.get_moe_blocks():
+                moe.init_from_ffn_layers(lin1, lin2)
+
+        elif self.config.use_moe_icl and has_moe_in_ckpt:
+            if self.master_process:
+                print("[MoE] MoE weights found in checkpoint → skipping FFN init")
+
         if self.config.only_load_model:
             print("Only loading model weights")
         else:
@@ -408,6 +496,30 @@ class Trainer:
                     os.remove(ckpt_path)
                 except Exception as e:
                     print(f"Error removing checkpoint {ckpt_path}: {e}")
+
+    def upload_latest_checkpoint_to_wandb(self):
+        """Upload the latest checkpoint in checkpoint_dir to W&B as an artifact."""
+        if self.wandb_run is None or not self.master_process:
+            return
+
+        ckpt_path = self.get_latest_checkpoint()
+        if ckpt_path is None:
+            print("No checkpoint found to upload to W&B.")
+            return
+
+        artifact = wandb.Artifact(
+            name=f"tabicl-checkpoint-{self.wandb_run.id}",
+            type="model",
+            metadata={
+                "step": self.curr_step,
+                "checkpoint_path": ckpt_path,
+            },
+        )
+
+        artifact.add_file(ckpt_path)
+        wandb.log_artifact(artifact)
+
+        print(f"Uploaded checkpoint to W&B: {ckpt_path}")
 
     @ddp_cleanup
     def train(self):
@@ -561,7 +673,7 @@ class Trainer:
         dict
             Result dictionary
         """
-        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
+        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size, micro_moip = micro_batch
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
 
@@ -569,16 +681,16 @@ class Trainer:
         micro_X = micro_X.to(self.config.device)
         micro_y = micro_y.to(self.config.device)
         micro_d = micro_d.to(self.config.device)
+        micro_moip = micro_moip.to(self.config.device)
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
 
-        # Set DDP gradient sync for last micro batch only
         if self.ddp:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
         with self.amp_ctx:
-            pred = self.model(micro_X, y_train, micro_d)  # (B, test_size, max_classes)
+            pred = self.model(micro_X, y_train, micro_d, moip_ids=micro_moip)  # (B, test_size, max_classes)
             pred = pred.flatten(end_dim=-2)
             true = y_test.long().flatten()
             loss = F.cross_entropy(pred, true)
@@ -639,7 +751,7 @@ class Trainer:
                     results[k] += v
             except torch.cuda.OutOfMemoryError:
                 print(
-                    f"Warning: OOM error in micro-batch {idx+1}/{num_micro_batches} at step {self.curr_step}. Skipping."
+                    f"Warning: OOM error in micro-batch {idx + 1}/{num_micro_batches} at step {self.curr_step}. Skipping."
                 )
                 torch.cuda.empty_cache()
                 failed_batches += 1
@@ -656,6 +768,12 @@ class Trainer:
         if self.config.gradient_clipping > 0:
             self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+
+        if self.wandb_run is not None and self.master_process:
+            log_moe_metrics(
+                model=self.model,
+                step=self.curr_step,
+            )
 
         # Update parameters
         self.scaler.step(self.optimizer)

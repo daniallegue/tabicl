@@ -466,7 +466,6 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         return self.dropout2(x)
 
-
 class InducedSelfAttentionBlock(nn.Module):
     """Induced Self-Attention for efficient O(n) attention on large sets.
 
@@ -581,7 +580,6 @@ class InducedSelfAttentionBlock(nn.Module):
         Tensor
             Output tensor with same shape as input
         """
-
         skip_mask = (src == self.skip_value).all(dim=(-2, -1))  # batch shape
         if skip_mask.any():
             if skip_mask.all():

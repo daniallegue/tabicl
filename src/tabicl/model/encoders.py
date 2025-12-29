@@ -112,7 +112,6 @@ class Encoder(nn.Module):
 
         return out
 
-
 class SetTransformer(nn.Module):
     """Stack of induced self-attention blocks.
 
