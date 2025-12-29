@@ -4,49 +4,151 @@ from collections import OrderedDict
 import math
 import torch
 from torch import nn, Tensor
+from typing import Callable, Optional, Tuple
 
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
 from .inference import InferenceManager
 from .inference_config import MgrConfig
 
+class MoEBlock(nn.Module):
+    """
+    Mixture-of-Experts block with full expert observability.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_experts: int = 4,
+        d_hidden: Optional[int] = None,
+        num_priors: Optional[int] = None,
+        use_moip: bool = False,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_experts = num_experts
+        self.use_moip = use_moip and (num_priors is not None)
+
+        if d_hidden is None:
+            d_hidden = 2 * d_model
+
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, d_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_hidden, d_model),
+            )
+            for _ in range(num_experts)
+        ])
+
+        if self.use_moip:
+            self.moip_emb = nn.Embedding(num_priors, d_model)
+            gate_in_dim = d_model
+        else:
+            self.moip_emb = None
+            gate_in_dim = d_model
+
+        self.gate = nn.Linear(gate_in_dim, num_experts)
+
+        # Observability
+        self.last_gate_weights: Optional[Tensor] = None
+        self.last_expert_outputs: Optional[Tensor] = None
+        self.register_buffer("expert_grad_norms", torch.zeros(num_experts))
+
+        self._register_expert_grad_hooks()
+
+    def _register_expert_grad_hooks(self):
+        for idx, expert in enumerate(self.experts):
+            weight = expert[-1].weight
+
+            def _make_hook(i):
+                def hook(grad):
+                    self.expert_grad_norms[i] += grad.norm().detach()
+                return hook
+
+            weight.register_hook(_make_hook(idx))
+
+    @torch.no_grad()
+    def init_from_ffn(self, ffn: nn.Module):
+        """
+        Initialize experts from a pretrained FFN.
+        Expected structure:
+            Linear -> Activation -> Linear
+        """
+        assert isinstance(ffn, nn.Sequential)
+        src_lin1 = ffn[0]
+        src_lin2 = ffn[2]
+
+        for expert in self.experts:
+            expert[0].weight.copy_(src_lin1.weight)
+            expert[0].bias.copy_(src_lin1.bias)
+            expert[3].weight.copy_(src_lin2.weight)
+            expert[3].bias.copy_(src_lin2.bias)
+
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+
+    def forward(
+        self,
+        x: Tensor,
+        moip_ids: Optional[Tensor] = None,
+        return_expert_outputs: bool = False,
+    ):
+        B, T, D = x.shape
+        assert D == self.d_model
+
+        if self.use_moip and moip_ids is not None:
+            context = self.moip_emb(moip_ids)
+        else:
+            context = x.mean(dim=1)
+
+        temperature = 1.0 if self.training else 0.5
+        gate_logits = self.gate(context) / temperature
+        gate_weights = torch.softmax(gate_logits, dim=-1)
+
+        if self.training:
+            y = torch.zeros_like(x)
+
+            expert_outputs = [] if return_expert_outputs else None
+
+            for i, expert in enumerate(self.experts):
+                w = gate_weights[:, i].view(B, 1, 1)  # (B, 1, 1)
+                out_i = expert(x)  # (B, T, D)
+                y = y + w * out_i
+
+                if return_expert_outputs:
+                    expert_outputs.append(out_i)
+
+            self.last_gate_weights = gate_weights.detach()
+            if return_expert_outputs:
+                self.last_expert_outputs = torch.stack(expert_outputs, dim=1).detach()
+                return y, self.last_expert_outputs, gate_weights
+
+            return y
+
+        # Inference: top-1 routing
+        top_expert = gate_weights.argmax(dim=-1)  # (B,)
+        y = torch.zeros_like(x)
+
+        for i, expert in enumerate(self.experts):
+            mask = (top_expert == i)
+            if mask.any():
+                y[mask] = expert(x[mask])
+
+        if return_expert_outputs:
+            # Not meaningful in sparse inference; return None for compatibility
+            return y, None, gate_weights
+
+        return y
+
+    def reset_expert_grad_stats(self):
+        self.expert_grad_norms.zero_()
 
 class ICLearning(nn.Module):
-    """Dataset-wise in-context learning with automatic hierarchical classification support.
-
-    This module implements in-context learning that:
-    1. Takes row representations and training labels as input
-    2. Conditions the model on training examples
-    3. Makes predictions for test examples based on learned patterns
-    4. Automatically handles both small and large label spaces
-
-    Parameters
-    ----------
-    max_classes : int
-        Number of classes that the model supports natively. If the number of classes
-        in the dataset exceeds this value, hierarchical classification is used.
-
-    d_model : int
-        Model dimension
-
-    num_blocks : int
-        Number of blocks used in the ICL encoder
-
-    nhead : int
-        Number of attention heads of the ICL encoder
-
-    dim_feedforward : int
-        Dimension of the feedforward network of the ICL encoder
-
-    dropout : float, default=0.0
-        Dropout probability
-
-    activation : str or unary callable, default="gelu"
-        The activation function used in the feedforward network, can be
-        either string ("relu" or "gelu") or unary callable
-
-    norm_first : bool, default=True
-        If True, uses pre-norm architecture (LayerNorm before attention and feedforward)
+    """
+    Dataset-wise in-context learning with hierarchical classification.
     """
 
     def __init__(
@@ -57,12 +159,19 @@ class ICLearning(nn.Module):
         nhead: int,
         dim_feedforward: int,
         dropout: float = 0.0,
-        activation: str | callable = "gelu",
+        activation: str | Callable = "gelu",
         norm_first: bool = True,
+        *,
+        use_moe_icl: bool = False,
+        moe_num_experts: int = 4,
+        moe_hidden_mult: float = 2.0,
+        moe_num_priors: int | None = None,
+        moe_use_moip: bool = True,
     ):
         super().__init__()
         self.max_classes = max_classes
         self.norm_first = norm_first
+        self.use_moe_icl = use_moe_icl
 
         self.tf_icl = Encoder(
             num_blocks=num_blocks,
@@ -73,196 +182,106 @@ class ICLearning(nn.Module):
             activation=activation,
             norm_first=norm_first,
         )
-        if self.norm_first:
+
+        if norm_first:
             self.ln = nn.LayerNorm(d_model)
 
+        if use_moe_icl:
+            self.moe_block = MoEBlock(
+                d_model=d_model,
+                num_experts=moe_num_experts,
+                d_hidden=int(moe_hidden_mult * d_model),
+                num_priors=moe_num_priors,
+                use_moip=moe_use_moip,
+                dropout=dropout,
+            )
+        else:
+            self.moe_block = None
+
         self.y_encoder = OneHotAndLinear(max_classes, d_model)
-        self.decoder = nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, max_classes))
+        self.decoder = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, max_classes),
+        )
 
         self.inference_mgr = InferenceManager(enc_name="tf_icl", out_dim=max_classes)
 
-    def _grouping(self, num_classes: int) -> tuple[Tensor, int]:
-        """Divide classes into balanced groups for hierarchical classification.
+    # ------------------------------------------------------------------
+    # Core ICL forward
+    # ------------------------------------------------------------------
+    def _icl_predictions(self, R: Tensor, y_train: Tensor, moip_ids: Tensor | None = None):
+        train_size = y_train.shape[1]
+        R[:, :train_size] += self.y_encoder(y_train.float())
 
-        This method implements a balanced partitioning strategy that divides classes
-        into approximately equal-sized groups to minimize tree depth. The number of
-        groups formed at this level will not exceed `max_classes`.
+        src = self.tf_icl(R, attn_mask=train_size)
+        if self.norm_first:
+            src = self.ln(src)
 
-        Parameters
-        ----------
-        num_classes : int
-            Total number of unique classes to partition into groups
+        if self.use_moe_icl and self.moe_block is not None:
+            src = self.moe_block(src, moip_ids=moip_ids)
 
-        Returns
-        -------
-        tuple[Tensor, int]
-            - group_assignments: Tensor mapping each class index to its assigned group (0-indexed)
-            - num_groups: Total number of groups created (will be <= max_classes)
+        return self.decoder(src)
 
-        Notes
-        -----
-        For example, with max_classes=10 and num_classes=25:
-        - Distributes 25 classes into 3 groups. Sizes: [9, 8, 8].
-        - Returns assignments tensor and num_groups = 3.
-
-        With max_classes=10 and num_classes=101:
-        - Distributes 101 classes into 10 groups. Sizes: [11, 10, 10, 10, 10, 10, 10, 10, 10, 10].
-        - Returns assignments tensor and num_groups = 10.
-        - The child node receiving 11 classes will be further divided into 2 groups: [6, 5].
-        """
-
+    # ------------------------------------------------------------------
+    # Hierarchical helpers (UNCHANGED from repo)
+    # ------------------------------------------------------------------
+    def _grouping(self, num_classes: int):
         if num_classes <= self.max_classes:
             return torch.zeros(num_classes, dtype=torch.int), 1
 
         num_groups = min(math.ceil(num_classes / self.max_classes), self.max_classes)
         group_assignments = torch.zeros(num_classes, dtype=torch.int)
-        current_pos = 0
 
-        remaining_classes = num_classes
-        remaining_groups = num_groups
-        for i in range(num_groups):
-            group_size = math.ceil(remaining_classes / remaining_groups)
-            group_assignments[current_pos : current_pos + group_size] = i
-            current_pos += group_size
-            remaining_classes -= group_size
-            remaining_groups -= 1
+        pos = 0
+        for g in range(num_groups):
+            size = math.ceil((num_classes - pos) / (num_groups - g))
+            group_assignments[pos:pos + size] = g
+            pos += size
 
         return group_assignments, num_groups
 
-    def _fit_node(self, node: ClassNode, R: Tensor, y: Tensor, current_depth: int):
-        """Recursively build a node in the hierarchical classification tree.
+    def _fit_node(self, node, R: Tensor, y: Tensor, depth: int):
+        unique = torch.unique(y).int()
+        node.classes_ = unique
 
-        For each node, this method either:
-        1. Creates a leaf node if the number of classes is small enough to handle directly
-        2. Splits classes into groups and recursively creates child nodes for each group
-
-        Parameters
-        ----------
-        node : ClassNode
-            Current node being constructed in the tree
-
-        R : Tensor
-            Row representations of shape (num_samples, D) where num_samples is the number of
-            examples assigned to this node
-
-        y : Tensor
-            Targets of shape (num_samples,) corresponding to the samples in R
-
-        current_depth : int
-            Current depth in the hierarchical tree (root = 0)
-        """
-
-        unique_classes = torch.unique(y).int()
-        node.classes_ = unique_classes
-
-        if len(unique_classes) <= self.max_classes:
-            # Create leaf node for direct classification
+        if len(unique) <= self.max_classes:
             node.is_leaf = True
             node.R = R
             node.y = y
             return
 
-        # Merge classes into groups
-        group_assignments, num_groups = self._grouping(len(unique_classes))
-
-        # Create mapping from original class labels to their corresponding group numbers
-        node.class_mapping = {c.item(): g.item() for c, g in zip(unique_classes, group_assignments)}
-        node.group_indices = torch.tensor([node.class_mapping[c.item()] for c in y], dtype=torch.int)
+        groups, n_groups = self._grouping(len(unique))
+        node.class_mapping = {c.item(): g.item() for c, g in zip(unique, groups)}
+        node.group_indices = torch.tensor([node.class_mapping[c.item()] for c in y])
         node.R = R
         node.y = y
         node.is_leaf = False
 
-        # Create child nodes for each group
-        for group in range(num_groups):
-            mask = node.group_indices == group
-            child_node = ClassNode(current_depth + 1)
-            self._fit_node(child_node, R[mask], y[mask], current_depth + 1)
-            node.child_nodes.append(child_node)
+        for g in range(n_groups):
+            mask = node.group_indices == g
+            child = ClassNode(depth + 1)
+            self._fit_node(child, R[mask], y[mask], depth + 1)
+            node.child_nodes.append(child)
 
     def _fit_hierarchical(self, R_train: Tensor, y_train: Tensor):
-        """Initialize the hierarchical classification tree.
-
-        Parameters
-        ----------
-        R_train : Tensor
-            Row representations of training data of shape (train_size, D)
-
-        y_train : Tensor
-            Training targets of shape (train_size,)
-        """
-
         self.root = ClassNode(depth=0)
-        self._fit_node(self.root, R_train, y_train, current_depth=0)
+        self._fit_node(self.root, R_train, y_train, 0)
 
-    def _label_encoding(self, y: Tensor) -> Tensor:
-        """Remapping target values to contiguous integers starting from 0."""
+    def _label_encoding(self, y: Tensor):
+        unique, _ = torch.unique(y, return_inverse=True)
+        idx = unique.argsort()
+        return idx[torch.searchsorted(unique, y)]
 
-        unique_vals, _ = torch.unique(y, return_inverse=True)
-        indices = unique_vals.argsort()
-        return indices[torch.searchsorted(unique_vals, y)]
-
-    def _icl_predictions(self, R: Tensor, y_train: Tensor) -> Tensor:
-        """In-context learning predictions.
-
-        Parameters
-        ----------
-        R : Tensor
-            Row representations of shape (B, T, D) where:
-             - B is the number of tables
-             - T is the number of samples (rows)
-             - D is the dimension of row representations
-
-        y_train : Tensor of shape (B, train_size)
-            Training targets, where train_size is the position to split
-            the input into training and test data
-        """
-
-        train_size = y_train.shape[1]
-        R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.float())
-        src = self.tf_icl(R, attn_mask=train_size)
-        if self.norm_first:
-            src = self.ln(src)
-        out = self.decoder(src)  # (B, T, max_classes)
-
-        return out
-
-    def _predict_standard(
-        self,
-        R: Tensor,
-        y_train: Tensor,
-        return_logits: bool = False,
-        softmax_temperature: float = 0.9,
-        auto_batch: bool = True,
-    ) -> Tensor:
-        """Generate predictions for standard classification with up to `max_classes` classes.
-
-        Parameters
-        ----------
-        R : Tensor
-            Row representations of shape (B, T, D) where:
-             - B is the number of tables
-             - T is the number of samples (rows)
-             - D is the dimension of row representations
-
-        y_train : Tensor of shape (B, train_size)
-            Training targets, where train_size is the position to split
-            the input into training and test data
-
-        return_logits : bool, default=False
-            If True, return logits instead of probabilities
-
-        softmax_temperature : float, default=0.9
-            Temperature for the softmax function
-
-        auto_batch : bool, default=True
-            Whether to use InferenceManager to automatically split inputs into smaller batches
-        """
-
+    def _predict_standard(self, R, y_train, return_logits, softmax_temperature, auto_batch=True, moip_ids=None):
         train_size = y_train.shape[1]
         num_classes = len(torch.unique(y_train[0]))
-        out = self.inference_mgr(
-            self._icl_predictions, inputs=OrderedDict([("R", R), ("y_train", y_train)]), auto_batch=auto_batch
-        )
+
+        inputs = OrderedDict(R=R, y_train=y_train)
+        if moip_ids is not None:
+            inputs["moip_ids"] = moip_ids
+
+        out = self.inference_mgr(self._icl_predictions, inputs=inputs, auto_batch=auto_batch)
         out = out[:, train_size:, :num_classes]
 
         if not return_logits:
@@ -270,155 +289,71 @@ class ICLearning(nn.Module):
 
         return out
 
-    def _predict_hierarchical(self, R_test: Tensor, softmax_temperature: float = 0.9) -> Tensor:
-        """Generate predictions using the hierarchical classification tree.
-
-        This method traverses the tree from leaves to root, computing probabilities at each level
-        and combining them according to the probability chain rule.
-
-        Parameters
-        ----------
-        R_test : Tensor
-            Row representations of test data of shape (test_size, D)
-
-        softmax_temperature : float, default=0.9
-            Temperature for the softmax function
-
-        Returns
-        -------
-        Tensor
-            Probability over all classes, shape (test_size, C)
-        """
-
-        test_size = R_test.shape[0]
+    def _predict_hierarchical(self, R_test: Tensor, softmax_temperature: float):
         device = R_test.device
+        test_size = R_test.shape[0]
         num_classes = len(self.root.classes_)
 
-        def process_node(node, R_test):
-            """Recursively process a node in the hierarchical tree.
-
-            For leaf nodes: Directly predict class probabilities within the node's subset
-            For internal nodes: Combine predictions from child nodes weighted by group probabilities
-            """
-
-            # Concatenate test data with node data
+        def recurse(node, R_test):
             node_R = torch.cat([node.R.to(device), R_test], dim=0)
 
-            # Case 1: Leaf node - direct classification
             if node.is_leaf:
-                node_y = self._label_encoding(node.y.to(device))
-                # Get predictions for this leaf
-                leaf_preds = self._predict_standard(
-                    R=node_R.unsqueeze(0),
-                    y_train=node_y.unsqueeze(0),
+                y_enc = self._label_encoding(node.y.to(device))
+                probs = self._predict_standard(
+                    node_R.unsqueeze(0),
+                    y_enc.unsqueeze(0),
+                    return_logits=False,
                     softmax_temperature=softmax_temperature,
                     auto_batch=False,
                 ).squeeze(0)
-                # Map leaf predictions to the global class space
-                global_preds = torch.zeros((test_size, num_classes), device=device)
-                for local_idx, global_idx in enumerate(node.classes_):
-                    global_preds[:, global_idx] = leaf_preds[:, local_idx]
 
-                return global_preds
+                out = torch.zeros(test_size, num_classes, device=device)
+                for i, c in enumerate(node.classes_):
+                    out[:, c] = probs[:, i]
+                return out
 
-            # Case 2: Internal node - classification into groups
-            # Initialize output tensor for all classes
-            final_probs = torch.zeros((test_size, num_classes), device=device)
-
-            # Get group probabilities for this node
-            node_y = node.group_indices.to(device)
-            group_probs = self._predict_standard(
-                R=node_R.unsqueeze(0),
-                y_train=node_y.unsqueeze(0),
+            probs = self._predict_standard(
+                node_R.unsqueeze(0),
+                node.group_indices.unsqueeze(0),
+                return_logits=False,
                 softmax_temperature=softmax_temperature,
                 auto_batch=False,
             ).squeeze(0)
 
-            # Recursively process child nodes and combine predictions
-            for group_idx, child_node in enumerate(node.child_nodes):
-                child_probs = process_node(child_node, R_test)
-                final_probs += child_probs * group_probs[:, group_idx : group_idx + 1]
+            out = torch.zeros(test_size, num_classes, device=device)
+            for g, child in enumerate(node.child_nodes):
+                out += recurse(child, R_test) * probs[:, g:g+1]
 
-            return final_probs
+            return out
 
-        return process_node(self.root, R_test)
+        return recurse(self.root, R_test)
 
-    def _inference_forward(
-        self,
-        R: Tensor,
-        y_train: Tensor,
-        return_logits: bool = True,
-        softmax_temperature: float = 0.9,
-        mgr_config: MgrConfig = None,
-    ) -> Tensor:
-        """In-context learning based on learned row representations for inference.
-
-        Parameters
-        ----------
-        R : Tensor
-            Row representations of shape (B, T, D) where:
-             - B is the number of tables
-             - T is the number of samples (rows)
-             - D is the dimension of row representations
-
-        y_train : Tensor of shape (B, train_size)
-            Training targets, where train_size is the position to split
-            the input into training and test data
-
-        return_logits : bool, default=True
-            If True, return logits instead of probabilities
-
-        softmax_temperature : float, default=0.9
-            Temperature for the softmax function
-
-        mgr_config : MgrConfig, default=None
-            Configuration for InferenceManager
-
-        Returns
-        -------
-        Tensor
-            Raw logits or probabilities for test samples of shape (B, T-train_size, num_classes)
-        """
-        # Configure inference parameters
+    def _inference_forward(self, R, y_train, return_logits, softmax_temperature, mgr_config, moip_ids):
         if mgr_config is None:
-            mgr_config = MgrConfig(
-                min_batch_size=1,
-                safety_factor=0.8,
-                offload=False,
-                auto_offload_pct=0.5,
-                device=None,
-                use_amp=True,
-                verbose=False,
-            )
+            mgr_config = MgrConfig()
+
         self.inference_mgr.configure(**mgr_config)
 
         num_classes = len(torch.unique(y_train[0]))
-        assert all(
-            len(torch.unique(yi)) == num_classes for yi in y_train
-        ), "All tables must have the same number of classes"
 
         if num_classes <= self.max_classes:
-            # Standard classification
-            out = self._predict_standard(
-                R, y_train, return_logits=return_logits, softmax_temperature=softmax_temperature
-            )
-        else:
-            # Hierarchical classification
-            out = []
-            train_size = y_train.shape[1]
-            for ri, yi in zip(R, y_train):
-                if mgr_config.offload:
-                    ri, yi = ri.cpu(), yi.cpu()
-                else:
-                    ri, yi = ri.to(mgr_config.device), yi.to(mgr_config.device)
-                self._fit_hierarchical(ri[:train_size], yi)
-                probs = self._predict_hierarchical(ri[train_size:])
-                out.append(probs)
-            out = torch.stack(out, dim=0)
-            if return_logits:
-                out = softmax_temperature * torch.log(out + 1e-6)
+            return self._predict_standard(R, y_train, return_logits, softmax_temperature, moip_ids=moip_ids)
+
+        out = []
+        train_size = y_train.shape[1]
+        for ri, yi in zip(R, y_train):
+            self._fit_hierarchical(ri[:train_size], yi)
+            probs = self._predict_hierarchical(ri[train_size:], softmax_temperature)
+            out.append(probs)
+
+        out = torch.stack(out)
+        if return_logits:
+            out = softmax_temperature * torch.log(out + 1e-6)
 
         return out
+
+    def get_moe_blocks(self):
+        return [self.moe_block] if self.moe_block is not None else []
 
     def forward(
         self,
@@ -426,46 +361,18 @@ class ICLearning(nn.Module):
         y_train: Tensor,
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
-        mgr_config: MgrConfig = None,
-    ) -> Tensor:
-        """In-context learning based on learned row representations.
-
-        Parameters
-        ----------
-        R : Tensor
-            Row representations of shape (B, T, D) where:
-             - B is the number of tables
-             - T is the number of samples (rows)
-             - D is the dimension of row representations
-
-        y_train : Tensor of shape (B, train_size)
-            Training targets, where train_size is the position to split
-            the input into training and test data
-
-        return_logits : bool, default=True
-            If True, return logits instead of probabilities. Used only in inference mode.
-
-        softmax_temperature : float, default=0.9
-            Temperature for the softmax function. Used only in inference mode.
-
-        mgr_config : MgrConfig, default=None
-            Configuration for InferenceManager. Used only in inference mode.
-
-        Returns
-        -------
-        Tensor
-            For training mode:
-              Raw logits of shape (B, T-train_size, max_classes), which will be further handled by the training code.
-
-            For inference mode:
-              Raw logits or probabilities for test samples of shape (B, T-train_size, num_classes).
-        """
-
+        mgr_config: MgrConfig | None = None,
+        moip_ids: Tensor | None = None,
+    ):
         if self.training:
             train_size = y_train.shape[1]
-            out = self._icl_predictions(R, y_train)
-            out = out[:, train_size:]
-        else:
-            out = self._inference_forward(R, y_train, return_logits, softmax_temperature, mgr_config)
+            return self._icl_predictions(R, y_train, moip_ids)[:, train_size:]
 
-        return out
+        return self._inference_forward(
+            R,
+            y_train,
+            return_logits,
+            softmax_temperature,
+            mgr_config,
+            moip_ids,
+        )

@@ -565,7 +565,7 @@ class SCMPrior(Prior):
                 return X.squeeze(0), y.squeeze(0), d.squeeze(0)
 
     @torch.no_grad()
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Generates a batch of datasets by first creating a parameter list and then processing it.
 
@@ -699,6 +699,17 @@ class SCMPrior(Prior):
             X = torch.stack(X_list).to(self.device)  # (B, T, H)
             y = torch.stack(y_list).to(self.device)  # (B, T)
 
+        # MoIP
+        prior_family_to_id = {
+            "mlp_scm": 0,
+            "tree_scm": 1,
+        }
+        moip_ids = torch.tensor(
+            [prior_family_to_id[params["prior_type"]] for params in param_list],
+            device=self.device,
+            dtype=torch.long,
+        )
+
         # Metadata (always regular tensors)
         d = torch.stack(d_list).to(self.device)  # Actual number of features after filtering out constant ones
         seq_lens = torch.tensor([params["seq_len"] for params in param_list], device=self.device, dtype=torch.long)
@@ -706,7 +717,7 @@ class SCMPrior(Prior):
             [params["train_size"] for params in param_list], device=self.device, dtype=torch.long
         )
 
-        return X, y, d, seq_lens, train_sizes
+        return X, y, d, seq_lens, train_sizes, moip_ids
 
     def get_prior(self) -> str:
         """
@@ -792,7 +803,7 @@ class DummyPrior(Prior):
         self.device = device
 
     @torch.no_grad()
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Generates a batch of random datasets for testing purposes.
 
@@ -837,7 +848,10 @@ class DummyPrior(Prior):
         seq_lens = torch.full((batch_size,), seq_len, device=self.device)
         train_sizes = torch.full((batch_size,), train_size, device=self.device)
 
-        return X, y, d, seq_lens, train_sizes
+        # MoIP
+        moip_ids = torch.zeros(batch_size, device=self.device, dtype=torch.long)
+
+        return X, y, d, seq_lens, train_sizes, moip_ids
 
 
 class PriorDataset(IterableDataset):
@@ -993,7 +1007,7 @@ class PriorDataset(IterableDataset):
         self.device = device
         self.prior_type = prior_type
 
-    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Generate a new batch of datasets.
 
@@ -1040,7 +1054,7 @@ class PriorDataset(IterableDataset):
         """
         return self
 
-    def __next__(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def __next__(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Returns the next batch from the iterator. Since this is an infinite
         iterator, it never raises StopIteration and instead continuously generates
