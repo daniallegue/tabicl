@@ -4,7 +4,8 @@ from collections import OrderedDict
 import math
 import torch
 from torch import nn, Tensor
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
+import torch.nn.functional as F
 
 from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
@@ -50,7 +51,9 @@ class MoEBlock(nn.Module):
             self.moip_emb = None
             gate_in_dim = d_model
 
-        self.gate = nn.Linear(gate_in_dim, num_experts)
+        # Auxiliary loss
+        self.last_load_loss = None
+        self.col_gate = nn.Linear(d_model, num_experts)
 
         # Observability
         self.last_gate_weights: Optional[Tensor] = None
@@ -71,65 +74,93 @@ class MoEBlock(nn.Module):
             weight.register_hook(_make_hook(idx))
 
     @torch.no_grad()
-    def init_from_ffn(self, ffn: nn.Module):
+    def init_from_ffn(self, lin1: nn.Linear, lin2: nn.Linear):
         """
-        Initialize experts from a pretrained FFN.
+        Initialize all experts from a pretrained FFN.
+
         Expected structure:
-            Linear -> Activation -> Linear
+            lin1: Linear(d_model → d_hidden)
+            lin2: Linear(d_hidden → d_model)
         """
-        assert isinstance(ffn, nn.Sequential)
-        src_lin1 = ffn[0]
-        src_lin2 = ffn[2]
+        assert isinstance(lin1, nn.Linear)
+        assert isinstance(lin2, nn.Linear)
 
         for expert in self.experts:
-            expert[0].weight.copy_(src_lin1.weight)
-            expert[0].bias.copy_(src_lin1.bias)
-            expert[3].weight.copy_(src_lin2.weight)
-            expert[3].bias.copy_(src_lin2.bias)
+            expert[0].weight.copy_(lin1.weight)
+            expert[0].bias.copy_(lin1.bias)
+            expert[3].weight.copy_(lin2.weight)
+            expert[3].bias.copy_(lin2.bias)
 
-        nn.init.zeros_(self.gate.weight)
-        nn.init.zeros_(self.gate.bias)
+        # Neutral routing at init
+        nn.init.zeros_(self.row_gate.weight)
+        nn.init.zeros_(self.row_gate.bias)
+        nn.init.zeros_(self.col_gate.weight)
+        nn.init.zeros_(self.col_gate.bias)
+
+        if self.moip_emb is not None:
+            nn.init.zeros_(self.moip_emb.weight)
 
     def forward(
         self,
         x: Tensor,
         moip_ids: Optional[Tensor] = None,
+        column_context: Optional[Tensor] = None,
         return_expert_outputs: bool = False,
     ):
         B, T, D = x.shape
         assert D == self.d_model
 
-        if self.use_moip and moip_ids is not None:
-            context = self.moip_emb(moip_ids)
+        if column_context is not None:
+            column_context = F.layer_norm(column_context, column_context.shape[-1:]) # Normalize
+            col_logits = self.col_gate(column_context)  # (B, E)
         else:
-            context = x.mean(dim=1)
+            col_logits = torch.zeros(
+                B, self.num_experts,
+                device=x.device,
+                dtype=x.dtype
+            )
 
-        temperature = 1.0 if self.training else 0.5
-        gate_logits = self.gate(context) / temperature
-        gate_weights = torch.softmax(gate_logits, dim=-1)
+        gate_logits = col_logits
+
+        if self.use_moip and moip_ids is not None:
+            gate_logits = gate_logits + self.moip_emb(moip_ids)
+
+        temperature = 0.7 if self.training else 0.5
+        gate_weights = torch.softmax(gate_logits / temperature, dim=-1)
 
         if self.training:
             y = torch.zeros_like(x)
-
             expert_outputs = [] if return_expert_outputs else None
 
-            for i, expert in enumerate(self.experts):
-                w = gate_weights[:, i].view(B, 1, 1)  # (B, 1, 1)
-                out_i = expert(x)  # (B, T, D)
-                y = y + w * out_i
+            k = 2
+            topk_vals, topk_idx = torch.topk(gate_weights, k=k, dim=-1)
+            topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
 
-                if return_expert_outputs:
-                    expert_outputs.append(out_i)
+            y = torch.zeros_like(x)
+            for j in range(k):
+                idx = topk_idx[:, j]  # (B,)
+                w = topk_vals[:, j].view(B, 1, 1)
+
+                for i in range(self.num_experts):
+                    mask = (idx == i)
+                    if mask.any():
+                        y[mask] += w[mask] * self.experts[i](x[mask])
 
             self.last_gate_weights = gate_weights.detach()
-            if return_expert_outputs:
-                self.last_expert_outputs = torch.stack(expert_outputs, dim=1).detach()
-                return y, self.last_expert_outputs, gate_weights
+
+            # Computes auxiliary loss
+            importance = gate_weights.mean(dim=0)  # (E,)
+            load_loss = self.num_experts * (importance * importance).sum()
+            self.last_load_loss = load_loss
+
+            # if return_expert_outputs:
+            #     self.last_expert_outputs = torch.stack(expert_outputs, dim=1).detach()
+            #     return y, self.last_expert_outputs, gate_weights
 
             return y
 
-        # Inference: top-1 routing
-        top_expert = gate_weights.argmax(dim=-1)  # (B,)
+        # Inference: top 1 routing
+        top_expert = gate_weights.argmax(dim=-1)
         y = torch.zeros_like(x)
 
         for i, expert in enumerate(self.experts):
@@ -137,9 +168,8 @@ class MoEBlock(nn.Module):
             if mask.any():
                 y[mask] = expert(x[mask])
 
-        if return_expert_outputs:
-            # Not meaningful in sparse inference; return None for compatibility
-            return y, None, gate_weights
+        # if return_expert_outputs:
+        #     return y, None, gate_weights
 
         return y
 
@@ -207,10 +237,7 @@ class ICLearning(nn.Module):
 
         self.inference_mgr = InferenceManager(enc_name="tf_icl", out_dim=max_classes)
 
-    # ------------------------------------------------------------------
-    # Core ICL forward
-    # ------------------------------------------------------------------
-    def _icl_predictions(self, R: Tensor, y_train: Tensor, moip_ids: Tensor | None = None):
+    def _icl_predictions(self, R: Tensor, y_train: Tensor, moip_ids: Tensor | None = None, column_context: Tensor | None = None):
         train_size = y_train.shape[1]
         R[:, :train_size] += self.y_encoder(y_train.float())
 
@@ -219,13 +246,10 @@ class ICLearning(nn.Module):
             src = self.ln(src)
 
         if self.use_moe_icl and self.moe_block is not None:
-            src = self.moe_block(src, moip_ids=moip_ids)
+            src = self.moe_block(src, moip_ids=moip_ids, column_context=column_context)
 
         return self.decoder(src)
 
-    # ------------------------------------------------------------------
-    # Hierarchical helpers (UNCHANGED from repo)
-    # ------------------------------------------------------------------
     def _grouping(self, num_classes: int):
         if num_classes <= self.max_classes:
             return torch.zeros(num_classes, dtype=torch.int), 1
@@ -273,11 +297,11 @@ class ICLearning(nn.Module):
         idx = unique.argsort()
         return idx[torch.searchsorted(unique, y)]
 
-    def _predict_standard(self, R, y_train, return_logits, softmax_temperature, auto_batch=True, moip_ids=None):
+    def _predict_standard(self, R, y_train, return_logits, softmax_temperature, auto_batch=True, moip_ids=None, column_context=None):
         train_size = y_train.shape[1]
         num_classes = len(torch.unique(y_train[0]))
 
-        inputs = OrderedDict(R=R, y_train=y_train)
+        inputs = OrderedDict(R=R, y_train=y_train, column_context=column_context,)
         if moip_ids is not None:
             inputs["moip_ids"] = moip_ids
 
@@ -328,7 +352,7 @@ class ICLearning(nn.Module):
 
         return recurse(self.root, R_test)
 
-    def _inference_forward(self, R, y_train, return_logits, softmax_temperature, mgr_config, moip_ids):
+    def _inference_forward(self, R, y_train, return_logits, softmax_temperature, mgr_config, moip_ids, column_context):
         if mgr_config is None:
             mgr_config = MgrConfig()
 
@@ -337,7 +361,7 @@ class ICLearning(nn.Module):
         num_classes = len(torch.unique(y_train[0]))
 
         if num_classes <= self.max_classes:
-            return self._predict_standard(R, y_train, return_logits, softmax_temperature, moip_ids=moip_ids)
+            return self._predict_standard(R, y_train, return_logits, softmax_temperature, moip_ids=moip_ids, column_context=column_context)
 
         out = []
         train_size = y_train.shape[1]
@@ -363,10 +387,11 @@ class ICLearning(nn.Module):
         softmax_temperature: float = 0.9,
         mgr_config: MgrConfig | None = None,
         moip_ids: Tensor | None = None,
+        column_context: Tensor | None = None,
     ):
         if self.training:
             train_size = y_train.shape[1]
-            return self._icl_predictions(R, y_train, moip_ids)[:, train_size:]
+            return self._icl_predictions(R, y_train, moip_ids, column_context)[:, train_size:]
 
         return self._inference_forward(
             R,
@@ -375,4 +400,5 @@ class ICLearning(nn.Module):
             softmax_temperature,
             mgr_config,
             moip_ids,
+            column_context
         )

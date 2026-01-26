@@ -290,7 +290,8 @@ class ColEmbedding(nn.Module):
         train_size: Optional[int] = None,
         feature_shuffles: Optional[List[List[int]]] = None,
         mgr_config: MgrConfig = None,
-    ) -> Tensor:
+        return_col_embeds: bool = False
+    ) -> [Tensor, Optional[Tensor]]:
         """Transform input table into embeddings.
 
         Parameters
@@ -317,6 +318,10 @@ class ColEmbedding(nn.Module):
         mgr_config : MgrConfig, default=None
             Configuration for InferenceManager. Used only in inference mode.
 
+        return_col_embeds : bool, default=False
+            If True, also return the raw column embeddings before any shuffling.
+            Used only in inference mode.
+
         Returns
         -------
         Tensor
@@ -329,5 +334,10 @@ class ColEmbedding(nn.Module):
             embeddings = self._train_forward(X, d, train_size)
         else:
             embeddings = self._inference_forward(X, train_size, feature_shuffles, mgr_config)
+
+        if return_col_embeds:
+            # Aggregate rows → column embeddings
+            col_embeds = embeddings.mean(dim=1)  # (B, H+C, E)
+            return embeddings, col_embeds
 
         return embeddings  # (B, T, H+C, E)

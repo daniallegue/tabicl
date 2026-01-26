@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional, List, Callable
-from torch import nn, Tensor
+from torch import nn, Tensor, cat
 
 from .embedding import ColEmbedding
 from .interaction import RowInteraction
@@ -136,6 +136,9 @@ class TabICL(nn.Module):
             norm_first=norm_first,
         )
 
+        self.col_context_proj = nn.Linear(2 * embed_dim, embed_dim)
+        self.col_context_to_icl = nn.Linear(embed_dim, embed_dim * row_num_cls)
+
         icl_dim = embed_dim * row_num_cls  # CLS tokens are concatenated for ICL
         self.icl_predictor = ICLearning(
             max_classes=max_classes,
@@ -190,12 +193,29 @@ class TabICL(nn.Module):
             d = None
 
         # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder(X, d=d, train_size=None if embed_with_test else train_size), d=d
+        embeddings, col_embeds = self.col_embedder(
+            X,
+            d=d,
+            train_size=None if embed_with_test else train_size,
+            return_col_embeds=True,
         )
 
+        representations = self.row_interactor(embeddings, d=d)
+
+        if self.col_embedder.reserve_cls_tokens > 0:
+            col_embeds = col_embeds[:, self.col_embedder.reserve_cls_tokens:, :]
+
+        mean = col_embeds.mean(dim=1)
+        std = col_embeds.std(dim=1)
+
+        column_context = self.col_context_proj(
+            cat([mean, std], dim=-1)
+        )
+        column_context = self.col_context_to_icl(column_context)
+        column_context = column_context.detach()
+
         # Dataset-wise in-context learning
-        out = self.icl_predictor(representations, y_train=y_train, moip_ids=moip_ids)
+        out = self.icl_predictor(representations, y_train=y_train, moip_ids=moip_ids, column_context=column_context,)
 
         return out
 
@@ -260,15 +280,35 @@ class TabICL(nn.Module):
             inference_config = InferenceConfig()
 
         # Column-wise embedding -> Row-wise interaction
+        embeddings, col_embeds = self.col_embedder(
+            X,
+            train_size=None if embed_with_test else train_size,
+            feature_shuffles=feature_shuffles,
+            mgr_config=inference_config.COL_CONFIG,
+            return_col_embeds=True,
+        )
+
         representations = self.row_interactor(
-            self.col_embedder(
-                X,
-                train_size=None if embed_with_test else train_size,
-                feature_shuffles=feature_shuffles,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
+            embeddings,
             mgr_config=inference_config.ROW_CONFIG,
         )
+
+        # Compute column context
+        if self.col_embedder.reserve_cls_tokens > 0:
+            col_embeds = col_embeds[:, self.col_embedder.reserve_cls_tokens:, :]
+
+        mean = col_embeds.mean(dim=1)
+        std = col_embeds.std(dim=1)
+
+        device = self.col_context_proj.weight.device
+        mean = mean.to(device)
+        std = std.to(device)
+
+        column_context = self.col_context_proj(
+            cat([mean, std], dim=-1)
+        )
+        column_context = self.col_context_to_icl(column_context)
+        column_context = column_context.detach()
 
         # Dataset-wise in-context learning
         out = self.icl_predictor(
@@ -278,6 +318,7 @@ class TabICL(nn.Module):
             softmax_temperature=softmax_temperature,
             mgr_config=inference_config.ICL_CONFIG,
             moip_ids=moip_ids,
+            column_context=column_context,
         )
 
         return out

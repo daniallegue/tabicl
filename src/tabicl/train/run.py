@@ -430,7 +430,7 @@ class Trainer:
             lin2 = last_block.linear2
 
             for moe in icl.get_moe_blocks():
-                moe.init_from_ffn_layers(lin1, lin2)
+                moe.init_from_ffn(lin1, lin2)
 
         elif self.config.use_moe_icl and has_moe_in_ckpt:
             if self.master_process:
@@ -694,6 +694,12 @@ class Trainer:
             pred = pred.flatten(end_dim=-2)
             true = y_test.long().flatten()
             loss = F.cross_entropy(pred, true)
+
+            # Adds MoE Scale Loss
+            if self.config.use_moe_icl:
+                for moe in self.raw_model.icl_predictor.get_moe_blocks():
+                    if moe.last_load_loss is not None:
+                        loss = loss + 1e-3 * moe.last_load_loss # TODO: Add to config
 
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
