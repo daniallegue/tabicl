@@ -699,17 +699,6 @@ class SCMPrior(Prior):
             X = torch.stack(X_list).to(self.device)  # (B, T, H)
             y = torch.stack(y_list).to(self.device)  # (B, T)
 
-        # MoIP
-        prior_family_to_id = {
-            "mlp_scm": 0,
-            "tree_scm": 1,
-        }
-        moip_ids = torch.tensor(
-            [prior_family_to_id[params["prior_type"]] for params in param_list],
-            device=self.device,
-            dtype=torch.long,
-        )
-
         # Metadata (always regular tensors)
         d = torch.stack(d_list).to(self.device)  # Actual number of features after filtering out constant ones
         seq_lens = torch.tensor([params["seq_len"] for params in param_list], device=self.device, dtype=torch.long)
@@ -717,7 +706,7 @@ class SCMPrior(Prior):
             [params["train_size"] for params in param_list], device=self.device, dtype=torch.long
         )
 
-        return X, y, d, seq_lens, train_sizes, moip_ids
+        return X, y, d, seq_lens, train_sizes
 
     def get_prior(self) -> str:
         """
@@ -848,10 +837,7 @@ class DummyPrior(Prior):
         seq_lens = torch.full((batch_size,), seq_len, device=self.device)
         train_sizes = torch.full((batch_size,), train_size, device=self.device)
 
-        # MoIP
-        moip_ids = torch.zeros(batch_size, device=self.device, dtype=torch.long)
-
-        return X, y, d, seq_lens, train_sizes, moip_ids
+        return X, y, d, seq_lens, train_sizes
 
 
 class PriorDataset(IterableDataset):

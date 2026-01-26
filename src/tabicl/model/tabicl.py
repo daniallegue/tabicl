@@ -92,8 +92,6 @@ class TabICL(nn.Module):
         use_moe_icl: bool = False,
         moe_num_experts: int = 4,
         moe_hidden_mult: float = 2.0,
-        moe_num_priors: int | None = None,
-        moe_use_moip: bool = True,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -149,15 +147,13 @@ class TabICL(nn.Module):
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,
-            use_moe_icl = use_moe_icl,
+            use_moe_icl=use_moe_icl,
             moe_num_experts=moe_num_experts,
             moe_hidden_mult=moe_hidden_mult,
-            moe_num_priors=moe_num_priors,
-            moe_use_moip=moe_use_moip,
         )
 
     def _train_forward(
-        self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False, moip_ids: Optional[Tensor] = None
+        self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning for training.
 
@@ -215,7 +211,7 @@ class TabICL(nn.Module):
         column_context = column_context.detach()
 
         # Dataset-wise in-context learning
-        out = self.icl_predictor(representations, y_train=y_train, moip_ids=moip_ids, column_context=column_context,)
+        out = self.icl_predictor(representations, y_train=y_train, column_context=column_context)
 
         return out
 
@@ -228,7 +224,6 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: InferenceConfig = None,
-        moip_ids: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -262,9 +257,6 @@ class TabICL(nn.Module):
 
         inference_config: InferenceConfig
             Inference configuration
-
-        moip_ids : Optional[Tensor]
-            Optional integer MoIP ids of shape (B,). Used for MoE gating in the ICL module.
 
         Returns
         -------
@@ -317,7 +309,6 @@ class TabICL(nn.Module):
             return_logits=return_logits,
             softmax_temperature=softmax_temperature,
             mgr_config=inference_config.ICL_CONFIG,
-            moip_ids=moip_ids,
             column_context=column_context,
         )
 
@@ -333,7 +324,6 @@ class TabICL(nn.Module):
         return_logits: bool = True,
         softmax_temperature: float = 0.9,
         inference_config: InferenceConfig = None,
-        moip_ids: Optional[Tensor] = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -371,9 +361,6 @@ class TabICL(nn.Module):
         inference_config: InferenceConfig
             Inference configuration. Used only in training mode.
 
-        moip_ids : Optional[Tensor], default=None
-            Optional integer MoIP ids of shape (B,). Used for MoE gating in the ICL module.
-
         Returns
         -------
         Tensor
@@ -385,7 +372,7 @@ class TabICL(nn.Module):
         """
 
         if self.training:
-            out = self._train_forward(X, y_train, d=d, embed_with_test=embed_with_test, moip_ids=moip_ids,)
+            out = self._train_forward(X, y_train, d=d, embed_with_test=embed_with_test)
         else:
             out = self._inference_forward(
                 X,
@@ -395,7 +382,10 @@ class TabICL(nn.Module):
                 return_logits=return_logits,
                 softmax_temperature=softmax_temperature,
                 inference_config=inference_config,
-                moip_ids=moip_ids,
             )
 
         return out
+
+    def get_moe_blocks(self):
+        """Returns MoE blocks from the ICL predictor for observability."""
+        return self.icl_predictor.get_moe_blocks()

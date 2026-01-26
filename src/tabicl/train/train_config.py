@@ -189,8 +189,6 @@ def build_parser():
     parser.add_argument("--use_moe_icl", action="store_true", help="Enable mixture-of-experts inside the ICL transformer")
     parser.add_argument("--moe_num_experts", type=int, default=4, help="Number of experts in the MoE block")
     parser.add_argument("--moe_hidden_mult", type=float, default=2.0, help="Hidden layer multiplier for expert MLPs (d_hidden = moe_hidden_mult * d_model)")
-    parser.add_argument("--moe_num_priors", type=int, default=None, help="Number of MoIP prior categories for gating. ")
-    parser.add_argument("--moe_use_moip", type=str2bool, default=True, help="If True, use moip_ids for gating when provided. ")
 
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")
