@@ -23,10 +23,12 @@ class MoEBlock(nn.Module):
         num_experts: int = 4,
         d_hidden: Optional[int] = None,
         dropout: float = 0.0,
+        gate_grad_scale: float = 1.0,
     ):
         super().__init__()
         self.d_model = d_model
         self.num_experts = num_experts
+        self.gate_grad_scale = gate_grad_scale
 
         if d_hidden is None:
             d_hidden = 2 * d_model
@@ -96,6 +98,10 @@ class MoEBlock(nn.Module):
         if column_context is not None:
             column_context = F.layer_norm(column_context, column_context.shape[-1:]) # Normalize
             gate_logits = self.col_gate(column_context)  # (B, E)
+
+            # Apply gradient scaling if configured
+            if self.gate_grad_scale != 1.0:
+                gate_logits = gate_logits * self.gate_grad_scale
         else:
             gate_logits = torch.zeros(
                 B, self.num_experts,
@@ -176,6 +182,7 @@ class ICLearning(nn.Module):
         use_moe_icl: bool = False,
         moe_num_experts: int = 4,
         moe_hidden_mult: float = 2.0,
+        moe_gate_grad_scale: float = 1.0,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -201,6 +208,7 @@ class ICLearning(nn.Module):
                 num_experts=moe_num_experts,
                 d_hidden=int(moe_hidden_mult * d_model),
                 dropout=dropout,
+                gate_grad_scale=moe_gate_grad_scale,
             )
         else:
             self.moe_block = None

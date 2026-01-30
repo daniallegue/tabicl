@@ -92,6 +92,7 @@ class TabICL(nn.Module):
         use_moe_icl: bool = False,
         moe_num_experts: int = 4,
         moe_hidden_mult: float = 2.0,
+        moe_gate_grad_scale: float = 0.1,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -150,6 +151,7 @@ class TabICL(nn.Module):
             use_moe_icl=use_moe_icl,
             moe_num_experts=moe_num_experts,
             moe_hidden_mult=moe_hidden_mult,
+            moe_gate_grad_scale=moe_gate_grad_scale,
         )
 
     def _train_forward(
@@ -208,7 +210,6 @@ class TabICL(nn.Module):
             cat([mean, std], dim=-1)
         )
         column_context = self.col_context_to_icl(column_context)
-        column_context = column_context.detach()
 
         # Dataset-wise in-context learning
         out = self.icl_predictor(representations, y_train=y_train, column_context=column_context)
@@ -300,6 +301,7 @@ class TabICL(nn.Module):
             cat([mean, std], dim=-1)
         )
         column_context = self.col_context_to_icl(column_context)
+        # Keep detached for inference (no training needed)
         column_context = column_context.detach()
 
         # Dataset-wise in-context learning
