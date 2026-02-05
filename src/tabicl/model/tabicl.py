@@ -93,6 +93,7 @@ class TabICL(nn.Module):
         moe_num_experts: int = 4,
         moe_hidden_mult: float = 2.0,
         moe_gate_grad_scale: float = 0.1,
+        moe_routing_level: str = "batch",  # 'batch' or 'token'
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -152,6 +153,7 @@ class TabICL(nn.Module):
             moe_num_experts=moe_num_experts,
             moe_hidden_mult=moe_hidden_mult,
             moe_gate_grad_scale=moe_gate_grad_scale,
+            moe_routing_level=moe_routing_level,
         )
 
     def _train_forward(

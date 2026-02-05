@@ -233,6 +233,8 @@ class Trainer:
             "use_moe_icl": self.config.use_moe_icl,
             "moe_num_experts": self.config.moe_num_experts,
             "moe_hidden_mult": self.config.moe_hidden_mult,
+            "moe_gate_grad_scale": self.config.moe_gate_grad_scale,
+            "moe_routing_level": self.config.moe_routing_level,
         }
 
         model = TabICL(**self.model_config)

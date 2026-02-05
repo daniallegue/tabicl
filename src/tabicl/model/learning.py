@@ -15,6 +15,10 @@ from .inference_config import MgrConfig
 class MoEBlock(nn.Module):
     """
     Mixture-of-Experts block with full expert observability.
+
+    Supports two routing levels:
+    - 'batch': All tokens in a batch use the same expert(s), routed by column context
+    - 'token': Each token independently routed, conditioned on column context
     """
 
     def __init__(
@@ -24,11 +28,13 @@ class MoEBlock(nn.Module):
         d_hidden: Optional[int] = None,
         dropout: float = 0.0,
         gate_grad_scale: float = 1.0,
+        routing_level: str = "batch",  # 'batch' or 'token'
     ):
         super().__init__()
         self.d_model = d_model
         self.num_experts = num_experts
         self.gate_grad_scale = gate_grad_scale
+        self.routing_level = routing_level
 
         if d_hidden is None:
             d_hidden = 2 * d_model
@@ -45,7 +51,11 @@ class MoEBlock(nn.Module):
 
         # Auxiliary loss
         self.last_load_loss = None
-        self.col_gate = nn.Linear(d_model, num_experts)
+
+        # Gating networks
+        self.col_gate = nn.Linear(d_model, num_experts)  # For batch-level routing
+        if routing_level == "token":
+            self.token_gate = nn.Linear(d_model, num_experts)  # For token-level routing
 
         # Observability
         self.last_gate_weights: Optional[Tensor] = None
@@ -86,6 +96,9 @@ class MoEBlock(nn.Module):
         # Neutral routing at init (uniform distribution over experts)
         nn.init.zeros_(self.col_gate.weight)
         nn.init.zeros_(self.col_gate.bias)
+        if self.routing_level == "token":
+            nn.init.zeros_(self.token_gate.weight)
+            nn.init.zeros_(self.token_gate.bias)
 
     def forward(
         self,
@@ -95,19 +108,27 @@ class MoEBlock(nn.Module):
         B, T, D = x.shape
         assert D == self.d_model
 
+        if self.routing_level == "token":
+            return self._forward_token_level(x, column_context)
+        else:
+            return self._forward_batch_level(x, column_context)
+
+    def _forward_batch_level(
+        self,
+        x: Tensor,
+        column_context: Optional[Tensor] = None,
+    ):
+        """Batch-level routing: all tokens in a batch use same expert(s)."""
+        B, _, _ = x.shape
+
         if column_context is not None:
-            column_context = F.layer_norm(column_context, column_context.shape[-1:]) # Normalize
+            column_context = F.layer_norm(column_context, column_context.shape[-1:])
             gate_logits = self.col_gate(column_context)  # (B, E)
 
-            # Apply gradient scaling if configured
             if self.gate_grad_scale != 1.0:
                 gate_logits = gate_logits * self.gate_grad_scale
         else:
-            gate_logits = torch.zeros(
-                B, self.num_experts,
-                device=x.device,
-                dtype=x.dtype
-            )
+            gate_logits = torch.zeros(B, self.num_experts, device=x.device, dtype=x.dtype)
 
         temperature = 0.7 if self.training else 0.5
         gate_weights = torch.softmax(gate_logits / temperature, dim=-1)
@@ -117,39 +138,29 @@ class MoEBlock(nn.Module):
             topk_vals, topk_idx = torch.topk(gate_weights, k=k, dim=-1)
             topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
 
-            # Efficient expert batching: process each expert once with all its assigned tokens
             y = torch.zeros_like(x)
 
             for expert_id in range(self.num_experts):
-                # Find all tokens assigned to this expert (across all top-k positions)
-                expert_mask = (topk_idx == expert_id).any(dim=-1)  # (B,) - which samples use this expert
+                expert_mask = (topk_idx == expert_id).any(dim=-1)  # (B,)
 
                 if not expert_mask.any():
                     continue
 
-                # Get positions in top-k where this expert appears for each sample
                 positions = (topk_idx == expert_id).long()  # (B, k)
-
-                # Gather weights: for each sample, sum weights where expert_id appears in top-k
                 expert_weights = (positions * topk_vals).sum(dim=-1)  # (B,)
 
-                # Process all tokens for this expert at once (efficient batching)
-                expert_input = x[expert_mask]  # (num_active_samples, T, D)
-                expert_output = self.experts[expert_id](expert_input)  # (num_active_samples, T, D)
-
-                # Add weighted expert output back
+                expert_input = x[expert_mask]
+                expert_output = self.experts[expert_id](expert_input)
                 y[expert_mask] += expert_weights[expert_mask].view(-1, 1, 1) * expert_output
 
             self.last_gate_weights = gate_weights.detach()
 
-            # Auxiliary load balancing loss
-            importance = gate_weights.mean(dim=0)  # (E,)
-            load_loss = self.num_experts * (importance * importance).sum()
-            self.last_load_loss = load_loss
+            importance = gate_weights.mean(dim=0)
+            self.last_load_loss = self.num_experts * (importance * importance).sum()
 
             return y
 
-        # Inference: top-1 routing for maximum efficiency
+        # Inference: top-1 routing
         top_expert = gate_weights.argmax(dim=-1)  # (B,)
         y = torch.zeros_like(x)
 
@@ -159,6 +170,79 @@ class MoEBlock(nn.Module):
                 y[mask] = self.experts[expert_id](x[mask])
 
         return y
+
+    def _forward_token_level(
+        self,
+        x: Tensor,
+        column_context: Optional[Tensor] = None,
+    ):
+        """Token-level routing: each token independently routed, conditioned on column context."""
+        B, T, D = x.shape
+
+        # Token-level gating conditioned on column context
+        x_normed = F.layer_norm(x, x.shape[-1:])
+        gate_logits = self.token_gate(x_normed)  # (B, T, E)
+
+        # Add column context bias to routing (shared across tokens)
+        if column_context is not None:
+            col_normed = F.layer_norm(column_context, column_context.shape[-1:])
+            col_bias = self.col_gate(col_normed)  # (B, E)
+            gate_logits = gate_logits + col_bias.unsqueeze(1)  # (B, T, E)
+
+        if self.gate_grad_scale != 1.0:
+            gate_logits = gate_logits * self.gate_grad_scale
+
+        temperature = 0.7 if self.training else 0.5
+        gate_weights = torch.softmax(gate_logits / temperature, dim=-1)  # (B, T, E)
+
+        if self.training:
+            k = 2
+            topk_vals, topk_idx = torch.topk(gate_weights, k=k, dim=-1)  # (B, T, k)
+            topk_vals = topk_vals / topk_vals.sum(dim=-1, keepdim=True)
+
+            # Flatten for efficient processing
+            x_flat = x.view(B * T, D)  # (B*T, D)
+            topk_idx_flat = topk_idx.view(B * T, k)  # (B*T, k)
+            topk_vals_flat = topk_vals.view(B * T, k)  # (B*T, k)
+
+            y_flat = torch.zeros_like(x_flat)
+
+            for expert_id in range(self.num_experts):
+                expert_mask = (topk_idx_flat == expert_id).any(dim=-1)  # (B*T,)
+
+                if not expert_mask.any():
+                    continue
+
+                positions = (topk_idx_flat == expert_id).long()  # (B*T, k)
+                expert_weights = (positions * topk_vals_flat).sum(dim=-1)  # (B*T,)
+
+                expert_input = x_flat[expert_mask]  # (num_tokens, D)
+                expert_output = self.experts[expert_id](expert_input)
+                y_flat[expert_mask] += expert_weights[expert_mask].unsqueeze(-1) * expert_output
+
+            y = y_flat.view(B, T, D)
+
+            self.last_gate_weights = gate_weights.mean(dim=1).detach()  # Average over tokens for logging
+
+            # Load balancing loss over all tokens
+            importance = gate_weights.mean(dim=(0, 1))  # (E,)
+            self.last_load_loss = self.num_experts * (importance * importance).sum()
+
+            return y
+
+        # Inference: top-1 routing per token
+        x_flat = x.view(B * T, D)
+        gate_flat = gate_weights.view(B * T, self.num_experts)
+        top_expert = gate_flat.argmax(dim=-1)  # (B*T,)
+
+        y_flat = torch.zeros_like(x_flat)
+
+        for expert_id in range(self.num_experts):
+            mask = (top_expert == expert_id)
+            if mask.any():
+                y_flat[mask] = self.experts[expert_id](x_flat[mask])
+
+        return y_flat.view(B, T, D)
 
     def reset_expert_grad_stats(self):
         self.expert_grad_norms.zero_()
@@ -183,6 +267,7 @@ class ICLearning(nn.Module):
         moe_num_experts: int = 4,
         moe_hidden_mult: float = 2.0,
         moe_gate_grad_scale: float = 1.0,
+        moe_routing_level: str = "batch",
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -209,6 +294,7 @@ class ICLearning(nn.Module):
                 d_hidden=int(moe_hidden_mult * d_model),
                 dropout=dropout,
                 gate_grad_scale=moe_gate_grad_scale,
+                routing_level=moe_routing_level,
             )
         else:
             self.moe_block = None
