@@ -44,7 +44,7 @@ class Timer:
         return False  # Don't suppress exceptions
 
 @torch.no_grad()
-def log_moe_metrics(model, step: int, moip_ids: torch.Tensor | None = None):
+def log_moe_metrics(model, step: int):
     """
     Logs MoE expert observability metrics to wandb.
 
@@ -233,8 +233,8 @@ class Trainer:
             "use_moe_icl": self.config.use_moe_icl,
             "moe_num_experts": self.config.moe_num_experts,
             "moe_hidden_mult": self.config.moe_hidden_mult,
-            "moe_num_priors": self.config.moe_num_priors,
-            "moe_use_moip": self.config.moe_use_moip,
+            "moe_gate_grad_scale": self.config.moe_gate_grad_scale,
+            "moe_routing_level": self.config.moe_routing_level,
         }
 
         model = TabICL(**self.model_config)
@@ -673,7 +673,7 @@ class Trainer:
         dict
             Result dictionary
         """
-        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size, micro_moip = micro_batch
+        micro_X, micro_y, micro_d, micro_seq_len, micro_train_size = micro_batch
         seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
         micro_X, micro_y = self.align_micro_batch(micro_X, micro_y, micro_d, seq_len)
 
@@ -681,7 +681,6 @@ class Trainer:
         micro_X = micro_X.to(self.config.device)
         micro_y = micro_y.to(self.config.device)
         micro_d = micro_d.to(self.config.device)
-        micro_moip = micro_moip.to(self.config.device)
 
         y_train = micro_y[:, :train_size]
         y_test = micro_y[:, train_size:]
@@ -690,7 +689,7 @@ class Trainer:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
         with self.amp_ctx:
-            pred = self.model(micro_X, y_train, micro_d, moip_ids=micro_moip)  # (B, test_size, max_classes)
+            pred = self.model(micro_X, y_train, micro_d)  # (B, test_size, max_classes)
             pred = pred.flatten(end_dim=-2)
             true = y_test.long().flatten()
             loss = F.cross_entropy(pred, true)
