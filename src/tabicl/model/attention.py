@@ -71,6 +71,7 @@ def multi_head_attention_forward(
     key_padding_mask: Optional[Tensor] = None,
     attn_mask: Optional[Tensor | int] = None,
     rope: Optional[RotaryEmbedding] = None,
+    attn_gate: Optional[Tensor] = None,
 ) -> Tensor:
     """Multi-head attention with support for rotary position embeddings
     as well as specialized processing when attn_mask is an integer.
@@ -172,6 +173,8 @@ def multi_head_attention_forward(
 
         attn_left = sdpa_with_flattened_batch(q_left, k_left, v_left, dropout_p=dropout_p)
         attn_left = attn_left.transpose(-3, -2).contiguous().view(*batch_shape, cut_pos, embed_dim)
+        if attn_gate is not None:
+            attn_left = attn_left * attn_gate[..., :cut_pos, :]
         attn_output[..., :cut_pos, :] = F.linear(attn_left, out_proj_weight, out_proj_bias)
 
         # Process right segment (tokens after cut_pos attending to tokens before cut_pos)
@@ -179,6 +182,8 @@ def multi_head_attention_forward(
             q_right = q[..., cut_pos:, :]  # (batch_shape, nh, tgt_len - cut_pos, hs)
             attn_right = sdpa_with_flattened_batch(q_right, k_left, v_left, dropout_p=dropout_p)
             attn_right = attn_right.transpose(-3, -2).contiguous().view(*batch_shape, tgt_len - cut_pos, embed_dim)
+            if attn_gate is not None:
+                attn_right = attn_right * attn_gate[..., cut_pos:, :]
             attn_output[..., cut_pos:, :] = F.linear(attn_right, out_proj_weight, out_proj_bias)
     else:
         # Process attention mask
@@ -217,6 +222,8 @@ def multi_head_attention_forward(
 
         # Reshape and project output
         attn_output = attn_output.transpose(-3, -2).contiguous().view(*batch_shape, tgt_len, embed_dim)
+        if attn_gate is not None:
+            attn_output = attn_output * attn_gate
         attn_output = F.linear(attn_output, out_proj_weight, out_proj_bias)  # (batch_shape, tgt_len, E)
 
     return attn_output

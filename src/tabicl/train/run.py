@@ -235,6 +235,7 @@ class Trainer:
             "moe_hidden_mult": self.config.moe_hidden_mult,
             "moe_gate_grad_scale": self.config.moe_gate_grad_scale,
             "moe_routing_level": self.config.moe_routing_level,
+            "use_gated_attn": self.config.use_gated_attn,
         }
 
         model = TabICL(**self.model_config)

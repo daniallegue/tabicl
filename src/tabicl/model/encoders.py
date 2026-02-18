@@ -52,6 +52,7 @@ class Encoder(nn.Module):
         norm_first: bool = True,
         use_rope: bool = False,
         rope_base: int = 100000,
+        use_gated_attn: bool = False,
     ):
         super().__init__()
 
@@ -67,6 +68,7 @@ class Encoder(nn.Module):
                     dropout=dropout,
                     activation=activation,
                     norm_first=norm_first,
+                    use_gated_attn=use_gated_attn,
                 )
                 for _ in range(num_blocks)
             ]
@@ -161,6 +163,7 @@ class SetTransformer(nn.Module):
         dropout: float = 0.0,
         activation: str = "gelu",
         norm_first: bool = True,
+        use_gated_attn: bool = False,
     ):
         super().__init__()
 
@@ -177,6 +180,7 @@ class SetTransformer(nn.Module):
                     dropout=dropout,
                     activation=activation,
                     norm_first=norm_first,
+                    use_gated_attn=use_gated_attn,
                 )
                 for _ in range(num_blocks)
             ]

@@ -268,6 +268,7 @@ class ICLearning(nn.Module):
         moe_hidden_mult: float = 2.0,
         moe_gate_grad_scale: float = 1.0,
         moe_routing_level: str = "batch",
+        use_gated_attn: bool = False,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -282,6 +283,7 @@ class ICLearning(nn.Module):
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,
+            use_gated_attn=use_gated_attn,
         )
 
         if norm_first:

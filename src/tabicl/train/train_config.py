@@ -191,6 +191,7 @@ def build_parser():
     parser.add_argument("--moe_hidden_mult", type=float, default=2.0, help="Hidden layer multiplier for expert MLPs (d_hidden = moe_hidden_mult * d_model)")
     parser.add_argument("--moe_gate_grad_scale", type=float, default=0.1, help="Gradient scaling factor for gating network")
     parser.add_argument("--moe_routing_level", type=str, default="batch", choices=["batch", "token"], help="Routing level: 'batch' (all tokens same expert) or 'token' (per-token routing)")
+    parser.add_argument("--use_gated_attn", action="store_true", help="Enable gated attention in TF_Col and TF_ICL layers (not TF_Row)")
 
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")

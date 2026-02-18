@@ -259,6 +259,7 @@ class MultiheadAttention(nn.MultiheadAttention):
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
         rope: Optional[RotaryEmbedding] = None,
+        attn_gate: Optional[Tensor] = None,
     ) -> Tensor:
         """Compute multi-head attention with support for rotary positional encoding.
 
@@ -290,6 +291,10 @@ class MultiheadAttention(nn.MultiheadAttention):
         rope : Optional[RotaryEmbedding]
             Rotary positional encoding
 
+        attn_gate : Optional[Tensor], default=None
+            Post-SDPA gate of shape (..., tgt_len, embed_dim). Applied elementwise
+            to SDPA output before the output projection.
+
         Returns
         -------
         Tensor
@@ -314,6 +319,7 @@ class MultiheadAttention(nn.MultiheadAttention):
             key_padding_mask=key_padding_mask,
             attn_mask=attn_mask,
             rope=rope,
+            attn_gate=attn_gate,
         )
 
 
@@ -350,10 +356,14 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
+        use_gated_attn: bool = False,
     ):
         super().__init__(d_model, nhead, dim_feedforward, dropout, activation, norm_first=norm_first, batch_first=True)
         del self.self_attn
         self.attn = MultiheadAttention(d_model, nhead, dropout)
+        self.use_gated_attn = use_gated_attn
+        if use_gated_attn:
+            self.gate_proj = nn.Linear(d_model, d_model)
         self.init_weights()
 
     def init_weights(self):
@@ -362,6 +372,9 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         nn.init.zeros_(self.attn.out_proj.bias)
         nn.init.zeros_(self.linear2.weight)
         nn.init.zeros_(self.linear2.bias)
+        if self.use_gated_attn:
+            nn.init.zeros_(self.gate_proj.weight)
+            nn.init.zeros_(self.gate_proj.bias)
 
     def forward(
         self,
@@ -439,13 +452,16 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         x = q
         if self.norm_first:
             # Pre-norm: normalize before attention and FFN
-            attn = self._attn_block(self.norm1(q), self.norm1(k), self.norm1(v), key_padding_mask, attn_mask, rope)
-            x = x + attn
+            q_normed = self.norm1(q)
+            k_normed = self.norm1(k)
+            v_normed = self.norm1(v)
+            gate = torch.sigmoid(self.gate_proj(q_normed)) if self.use_gated_attn else None
+            x = x + self._attn_block(q_normed, k_normed, v_normed, key_padding_mask, attn_mask, rope, gate)
             x = x + self._ff_block(self.norm2(x))
         else:
             # Post-norm: normalize after attention and FFN
-            attn = self._attn_block(q, k, v, key_padding_mask, attn_mask, rope)
-            x = self.norm1(x + attn)
+            gate = torch.sigmoid(self.gate_proj(q)) if self.use_gated_attn else None
+            x = self.norm1(x + self._attn_block(q, k, v, key_padding_mask, attn_mask, rope, gate))
             x = self.norm2(x + self._ff_block(x))
 
         return x
@@ -458,8 +474,9 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         key_padding_mask: Optional[Tensor],
         attn_mask: Optional[Tensor | int],
         rope: Optional[RotaryEmbedding],
+        attn_gate: Optional[Tensor] = None,
     ) -> Tensor:
-        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope)
+        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope, attn_gate=attn_gate)
         return self.dropout1(attn)
 
     def _ff_block(self, x: Tensor) -> Tensor:
@@ -520,13 +537,14 @@ class InducedSelfAttentionBlock(nn.Module):
         activation: str | callable = "gelu",
         norm_first: bool = True,
         skip_value: float = -100.0,
+        use_gated_attn: bool = False,
     ):
         super().__init__()
         self.skip_value = skip_value
 
         # Two-stage attention mechanism
-        self.multihead_attn1 = MultiheadAttentionBlock(d_model, nhead, dim_feedforward, dropout, activation, norm_first)
-        self.multihead_attn2 = MultiheadAttentionBlock(d_model, nhead, dim_feedforward, dropout, activation, norm_first)
+        self.multihead_attn1 = MultiheadAttentionBlock(d_model, nhead, dim_feedforward, dropout, activation, norm_first, use_gated_attn=use_gated_attn)
+        self.multihead_attn2 = MultiheadAttentionBlock(d_model, nhead, dim_feedforward, dropout, activation, norm_first, use_gated_attn=use_gated_attn)
 
         # Learnable inducing points
         self.num_inds = num_inds

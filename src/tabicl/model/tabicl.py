@@ -94,6 +94,7 @@ class TabICL(nn.Module):
         moe_hidden_mult: float = 2.0,
         moe_gate_grad_scale: float = 0.1,
         moe_routing_level: str = "batch",  # 'batch' or 'token'
+        use_gated_attn: bool = False,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -122,6 +123,7 @@ class TabICL(nn.Module):
             activation=activation,
             norm_first=norm_first,
             reserve_cls_tokens=row_num_cls,
+            use_gated_attn=use_gated_attn,
         )
 
         self.row_interactor = RowInteraction(
@@ -154,6 +156,7 @@ class TabICL(nn.Module):
             moe_hidden_mult=moe_hidden_mult,
             moe_gate_grad_scale=moe_gate_grad_scale,
             moe_routing_level=moe_routing_level,
+            use_gated_attn=use_gated_attn,
         )
 
     def _train_forward(
