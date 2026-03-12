@@ -72,6 +72,7 @@ def multi_head_attention_forward(
     attn_mask: Optional[Tensor | int] = None,
     rope: Optional[RotaryEmbedding] = None,
     attn_gate: Optional[Tensor] = None,
+    selective_attn_temp: Optional[Tensor] = None,
 ) -> Tensor:
     """Multi-head attention with support for rotary position embeddings
     as well as specialized processing when attn_mask is an integer.
@@ -125,6 +126,11 @@ def multi_head_attention_forward(
     rope : Optional[RotaryEmbedding]
         Rotary positional encoding
 
+    selective_attn_temp : Optional[Tensor], default=None
+        Query-dependent temperature of shape (..., tgt_len, num_heads). Scales Q
+        before SDPA to control per-query softmax sharpness (Selective Attention,
+        Zhang et al. 2024).
+
     Returns
     -------
     Tensor
@@ -150,6 +156,12 @@ def multi_head_attention_forward(
     q = q.view(*batch_shape, tgt_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, tgt_len, hs)
     k = k.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, src_len, hs)
     v = v.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, src_len, hs)
+
+    # Apply selective attention temperature scaling to Q (Zhang et al., 2024)
+    if selective_attn_temp is not None:
+        # selective_attn_temp: (*batch_shape, tgt_len, num_heads) → (*batch_shape, num_heads, tgt_len, 1)
+        temp = selective_attn_temp.transpose(-1, -2).unsqueeze(-1)
+        q = q * temp
 
     # Apply rotary position embeddings if provided
     if rope is not None:

@@ -90,6 +90,34 @@ def log_moe_metrics(model, step: int):
 
         moe.reset_expert_grad_stats()
 
+@torch.no_grad()
+def log_gateskip_metrics(model, step: int):
+    """
+    Logs GateSkip gate metrics to wandb.
+
+    For each ICL encoder block, logs the mean gate activation for the
+    attention and FFN gates. Lower values indicate the layer's output
+    is being suppressed (candidate for skipping).
+    """
+    raw_model = model.module if isinstance(model, DDP) else model
+
+    icl_encoder = raw_model.icl_predictor.tf_icl
+    metrics = {}
+
+    for block_idx, block in enumerate(icl_encoder.blocks):
+        if not block.last_gateskip_activations:
+            continue
+
+        for gate_idx, gate_act in enumerate(block.last_gateskip_activations):
+            module_name = "attn" if gate_idx == 0 else "ff"
+            # Mean importance score per token: (1/H) * sum_k g_{l,i,k}
+            # then average over batch and sequence
+            mean_score = gate_act.mean().item()
+            metrics[f"gateskip/block_{block_idx}/{module_name}_mean_gate"] = mean_score
+
+    if metrics:
+        wandb.log(metrics, step=step)
+
 def ddp_cleanup(func):
     """Decorator to clean up DDP process group after method execution.
 
@@ -236,6 +264,8 @@ class Trainer:
             "moe_gate_grad_scale": self.config.moe_gate_grad_scale,
             "moe_routing_level": self.config.moe_routing_level,
             "use_gated_attn": self.config.use_gated_attn,
+            "use_selective_attn": self.config.use_selective_attn,
+            "use_gateskip_icl": self.config.use_gateskip_icl,
         }
 
         model = TabICL(**self.model_config)
@@ -701,6 +731,11 @@ class Trainer:
                     if moe.last_load_loss is not None:
                         loss = loss + 1e-3 * moe.last_load_loss # TODO: Add to config
 
+            # Adds GateSkip sparsity loss
+            if self.config.use_gateskip_icl:
+                gateskip_loss = self.raw_model.gateskip_sparsity_loss()
+                loss = loss + self.config.gateskip_lambda * gateskip_loss
+
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
         self.scaler.scale(scaled_loss).backward()
@@ -780,6 +815,11 @@ class Trainer:
                 model=self.model,
                 step=self.curr_step,
             )
+            if self.config.use_gateskip_icl:
+                log_gateskip_metrics(
+                    model=self.model,
+                    step=self.curr_step,
+                )
 
         # Update parameters
         self.scaler.step(self.optimizer)

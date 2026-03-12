@@ -260,6 +260,7 @@ class MultiheadAttention(nn.MultiheadAttention):
         attn_mask: Optional[Tensor | int] = None,
         rope: Optional[RotaryEmbedding] = None,
         attn_gate: Optional[Tensor] = None,
+        selective_attn_temp: Optional[Tensor] = None,
     ) -> Tensor:
         """Compute multi-head attention with support for rotary positional encoding.
 
@@ -295,6 +296,9 @@ class MultiheadAttention(nn.MultiheadAttention):
             Post-SDPA gate of shape (..., tgt_len, embed_dim). Applied elementwise
             to SDPA output before the output projection.
 
+        selective_attn_temp : Optional[Tensor], default=None
+            Query-dependent temperature of shape (..., tgt_len, num_heads).
+
         Returns
         -------
         Tensor
@@ -320,7 +324,43 @@ class MultiheadAttention(nn.MultiheadAttention):
             attn_mask=attn_mask,
             rope=rope,
             attn_gate=attn_gate,
+            selective_attn_temp=selective_attn_temp,
         )
+
+
+class GateSkipGate(nn.Module):
+    """Learnable residual-stream gate from the GateSkip paper (Laitenberger et al., 2026).
+
+    A linear-sigmoid gate that modulates module output before it re-enters the residual stream.
+    Initialized so that σ(W·h + b) ≈ 1 at the start (identity-like behavior).
+
+    Parameters
+    ----------
+    d_model : int
+        Hidden dimension of the model.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.linear = nn.Linear(d_model, d_model)
+        # Initialize weights near zero and bias to 5 so σ(5) ≈ 1
+        nn.init.normal_(self.linear.weight, mean=0.0, std=0.01)
+        nn.init.constant_(self.linear.bias, 5.0)
+
+    def forward(self, h: Tensor) -> Tensor:
+        """Compute gate values from pre-module hidden states.
+
+        Parameters
+        ----------
+        h : Tensor
+            Hidden states of shape (..., d_model)
+
+        Returns
+        -------
+        Tensor
+            Gate values of shape (..., d_model) in range (0, 1)
+        """
+        return torch.sigmoid(self.linear(h))
 
 
 class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
@@ -357,6 +397,8 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         activation: str | callable = "gelu",
         norm_first: bool = True,
         use_gated_attn: bool = False,
+        use_selective_attn: bool = False,
+        use_gateskip: bool = False,
     ):
         super().__init__(d_model, nhead, dim_feedforward, dropout, activation, norm_first=norm_first, batch_first=True)
         del self.self_attn
@@ -364,6 +406,20 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         self.use_gated_attn = use_gated_attn
         if use_gated_attn:
             self.gate_proj = nn.Linear(d_model, d_model)
+        self.use_selective_attn = use_selective_attn
+        if use_selective_attn:
+            # Lightweight MLP producing per-head temperature scalars (Zhang et al., 2024)
+            bottleneck = nhead * 2
+            self.temp_mlp = nn.Sequential(
+                nn.Linear(d_model, bottleneck),
+                nn.GELU(),
+                nn.Linear(bottleneck, nhead, bias=False),
+            )
+        self.use_gateskip = use_gateskip
+        if use_gateskip:
+            self.gateskip_attn = GateSkipGate(d_model)
+            self.gateskip_ff = GateSkipGate(d_model)
+        self.last_gateskip_activations: List[Tensor] = []
         self.init_weights()
 
     def init_weights(self):
@@ -375,6 +431,9 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         if self.use_gated_attn:
             nn.init.zeros_(self.gate_proj.weight)
             nn.init.zeros_(self.gate_proj.bias)
+        if self.use_selective_attn:
+            # Zero-init output layer so τ = 1 + tanh(0) = 1 at initialization (identity)
+            nn.init.zeros_(self.temp_mlp[-1].weight)
 
     def forward(
         self,
@@ -450,19 +509,42 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
 
         # Apply layer depending on normalization order
         x = q
+        self.last_gateskip_activations = []
         if self.norm_first:
             # Pre-norm: normalize before attention and FFN
             q_normed = self.norm1(q)
             k_normed = self.norm1(k)
             v_normed = self.norm1(v)
             gate = torch.sigmoid(self.gate_proj(q_normed)) if self.use_gated_attn else None
-            x = x + self._attn_block(q_normed, k_normed, v_normed, key_padding_mask, attn_mask, rope, gate)
-            x = x + self._ff_block(self.norm2(x))
+            temp = (1 + torch.tanh(self.temp_mlp(q_normed))) if self.use_selective_attn else None
+            attn_out = self._attn_block(q_normed, k_normed, v_normed, key_padding_mask, attn_mask, rope, gate, temp)
+            if self.use_gateskip:
+                gs_attn = self.gateskip_attn(x)
+                self.last_gateskip_activations.append(gs_attn)
+                attn_out = attn_out * gs_attn
+            x = x + attn_out
+            ff_out = self._ff_block(self.norm2(x))
+            if self.use_gateskip:
+                gs_ff = self.gateskip_ff(x)
+                self.last_gateskip_activations.append(gs_ff)
+                ff_out = ff_out * gs_ff
+            x = x + ff_out
         else:
             # Post-norm: normalize after attention and FFN
             gate = torch.sigmoid(self.gate_proj(q)) if self.use_gated_attn else None
-            x = self.norm1(x + self._attn_block(q, k, v, key_padding_mask, attn_mask, rope, gate))
-            x = self.norm2(x + self._ff_block(x))
+            temp = (1 + torch.tanh(self.temp_mlp(q))) if self.use_selective_attn else None
+            attn_out = self._attn_block(q, k, v, key_padding_mask, attn_mask, rope, gate, temp)
+            if self.use_gateskip:
+                gs_attn = self.gateskip_attn(x)
+                self.last_gateskip_activations.append(gs_attn)
+                attn_out = attn_out * gs_attn
+            x = self.norm1(x + attn_out)
+            ff_out = self._ff_block(x)
+            if self.use_gateskip:
+                gs_ff = self.gateskip_ff(x)
+                self.last_gateskip_activations.append(gs_ff)
+                ff_out = ff_out * gs_ff
+            x = self.norm2(x + ff_out)
 
         return x
 
@@ -475,8 +557,9 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         attn_mask: Optional[Tensor | int],
         rope: Optional[RotaryEmbedding],
         attn_gate: Optional[Tensor] = None,
+        selective_attn_temp: Optional[Tensor] = None,
     ) -> Tensor:
-        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope, attn_gate=attn_gate)
+        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope, attn_gate=attn_gate, selective_attn_temp=selective_attn_temp)
         return self.dropout1(attn)
 
     def _ff_block(self, x: Tensor) -> Tensor:
@@ -538,13 +621,14 @@ class InducedSelfAttentionBlock(nn.Module):
         norm_first: bool = True,
         skip_value: float = -100.0,
         use_gated_attn: bool = False,
+        use_selective_attn: bool = False,
     ):
         super().__init__()
         self.skip_value = skip_value
 
         # Two-stage attention mechanism
-        self.multihead_attn1 = MultiheadAttentionBlock(d_model, nhead, dim_feedforward, dropout, activation, norm_first, use_gated_attn=use_gated_attn)
-        self.multihead_attn2 = MultiheadAttentionBlock(d_model, nhead, dim_feedforward, dropout, activation, norm_first, use_gated_attn=use_gated_attn)
+        self.multihead_attn1 = MultiheadAttentionBlock(d_model, nhead, dim_feedforward, dropout, activation, norm_first, use_gated_attn=use_gated_attn, use_selective_attn=use_selective_attn)
+        self.multihead_attn2 = MultiheadAttentionBlock(d_model, nhead, dim_feedforward, dropout, activation, norm_first, use_gated_attn=use_gated_attn, use_selective_attn=use_selective_attn)
 
         # Learnable inducing points
         self.num_inds = num_inds

@@ -68,6 +68,7 @@ class ColEmbedding(nn.Module):
         norm_first: bool = True,
         reserve_cls_tokens: int = 4,
         use_gated_attn: bool = False,
+        use_selective_attn: bool = False,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -84,6 +85,7 @@ class ColEmbedding(nn.Module):
             activation=activation,
             norm_first=norm_first,
             use_gated_attn=use_gated_attn,
+            use_selective_attn=use_selective_attn,
         )
 
         self.out_w = SkippableLinear(embed_dim, embed_dim)

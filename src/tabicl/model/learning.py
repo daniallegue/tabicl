@@ -269,11 +269,14 @@ class ICLearning(nn.Module):
         moe_gate_grad_scale: float = 1.0,
         moe_routing_level: str = "batch",
         use_gated_attn: bool = False,
+        use_selective_attn: bool = False,
+        use_gateskip_icl: bool = False,
     ):
         super().__init__()
         self.max_classes = max_classes
         self.norm_first = norm_first
         self.use_moe_icl = use_moe_icl
+        self.use_gateskip_icl = use_gateskip_icl
 
         self.tf_icl = Encoder(
             num_blocks=num_blocks,
@@ -284,6 +287,8 @@ class ICLearning(nn.Module):
             activation=activation,
             norm_first=norm_first,
             use_gated_attn=use_gated_attn,
+            use_selective_attn=use_selective_attn,
+            use_gateskip=use_gateskip_icl,
         )
 
         if norm_first:
@@ -446,6 +451,23 @@ class ICLearning(nn.Module):
             out = softmax_temperature * torch.log(out + 1e-6)
 
         return out
+
+    def gateskip_sparsity_loss(self) -> torch.Tensor:
+        """Compute L2 sparsity loss on GateSkip gate activations.
+
+        Returns the mean squared gate activation across all layers, tokens,
+        and hidden dimensions, encouraging gates to stay near zero for sparsity.
+
+        Returns
+        -------
+        Tensor
+            Scalar L2 sparsity loss.
+        """
+        activations = self.tf_icl.get_gateskip_activations()
+        if not activations:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        all_acts = torch.cat([a.flatten() for a in activations])
+        return (all_acts ** 2).mean()
 
     def get_moe_blocks(self):
         return [self.moe_block] if self.moe_block is not None else []

@@ -53,6 +53,8 @@ class Encoder(nn.Module):
         use_rope: bool = False,
         rope_base: int = 100000,
         use_gated_attn: bool = False,
+        use_selective_attn: bool = False,
+        use_gateskip: bool = False,
     ):
         super().__init__()
 
@@ -69,6 +71,8 @@ class Encoder(nn.Module):
                     activation=activation,
                     norm_first=norm_first,
                     use_gated_attn=use_gated_attn,
+                    use_selective_attn=use_selective_attn,
+                    use_gateskip=use_gateskip,
                 )
                 for _ in range(num_blocks)
             ]
@@ -113,6 +117,19 @@ class Encoder(nn.Module):
             out = block(q=out, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=self.rope)
 
         return out
+
+    def get_gateskip_activations(self):
+        """Collect all GateSkip gate activations from the last forward pass.
+
+        Returns
+        -------
+        list[Tensor]
+            List of gate activation tensors, two per block (attention and FFN).
+        """
+        activations = []
+        for block in self.blocks:
+            activations.extend(block.last_gateskip_activations)
+        return activations
 
 class SetTransformer(nn.Module):
     """Stack of induced self-attention blocks.
@@ -164,6 +181,7 @@ class SetTransformer(nn.Module):
         activation: str = "gelu",
         norm_first: bool = True,
         use_gated_attn: bool = False,
+        use_selective_attn: bool = False,
     ):
         super().__init__()
 
@@ -181,6 +199,7 @@ class SetTransformer(nn.Module):
                     activation=activation,
                     norm_first=norm_first,
                     use_gated_attn=use_gated_attn,
+                    use_selective_attn=use_selective_attn,
                 )
                 for _ in range(num_blocks)
             ]
