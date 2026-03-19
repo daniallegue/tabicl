@@ -118,6 +118,60 @@ def log_gateskip_metrics(model, step: int):
     if metrics:
         wandb.log(metrics, step=step)
 
+@torch.no_grad()
+def log_clogas_metrics(model, step: int):
+    """
+    Logs CLoGAS observability metrics to wandb.
+
+    Per block per head:
+      - beta: gating strength (shared across heads)
+      - tau: per-head temperature
+      - gamma_entropy: mean entropy of the class distribution
+      - mean_bias: mean additive bias (should be <= 0)
+      - mean_g: mean gate value (gamma indexed at y_train)
+    """
+    raw_model = model.module if isinstance(model, DDP) else model
+    icl_encoder = raw_model.icl_predictor.tf_icl
+    metrics = {}
+
+    for block_idx, block in enumerate(icl_encoder.blocks):
+        if not block.use_clogas:
+            continue
+
+        clogas = block.clogas
+        prefix = f"clogas/block_{block_idx}"
+
+        # beta — scalar gating strength
+        metrics[f"{prefix}/beta"] = clogas.beta.item()
+
+        # Per-head temperature
+        if clogas.last_tau is not None:
+            for h in range(clogas.nhead):
+                metrics[f"{prefix}/head_{h}/tau"] = clogas.last_tau[h].item()
+
+        # Gamma entropy per head: H(gamma) = -sum(gamma * log(gamma))
+        if clogas.last_gamma is not None:
+            gamma = clogas.last_gamma.detach()
+            ent = -(gamma * torch.log(gamma + 1e-8)).sum(dim=-1)  # (B, H, T)
+            for h in range(clogas.nhead):
+                metrics[f"{prefix}/head_{h}/gamma_entropy"] = ent[:, h].mean().item()
+
+        # Mean bias per head (should be <= 0)
+        if clogas.last_bias is not None:
+            bias = clogas.last_bias
+            for h in range(clogas.nhead):
+                metrics[f"{prefix}/head_{h}/mean_bias"] = bias[:, h].mean().item()
+
+        # Mean gate value per head (gamma[y_j])
+        if clogas.last_g is not None:
+            g = clogas.last_g
+            for h in range(clogas.nhead):
+                metrics[f"{prefix}/head_{h}/mean_g"] = g[:, h].mean().item()
+
+    if metrics:
+        wandb.log(metrics, step=step)
+
+
 def ddp_cleanup(func):
     """Decorator to clean up DDP process group after method execution.
 
@@ -266,6 +320,7 @@ class Trainer:
             "use_gated_attn": self.config.use_gated_attn,
             "use_selective_attn": self.config.use_selective_attn,
             "use_gateskip_icl": self.config.use_gateskip_icl,
+            "use_clogas": self.config.use_clogas,
         }
 
         model = TabICL(**self.model_config)
@@ -736,6 +791,19 @@ class Trainer:
                 gateskip_loss = self.raw_model.gateskip_sparsity_loss()
                 loss = loss + self.config.gateskip_lambda * gateskip_loss
 
+            # Adds CLoGAS losses: L_cal (calibration) + L_ent (entropy)
+            if self.config.use_clogas:
+                # L_cal: Brier score — penalizes miscalibrated probabilities
+                probs = F.softmax(pred, dim=-1)
+                true_onehot = F.one_hot(true, num_classes=self.config.max_classes).float()
+                cal_loss = ((probs - true_onehot) ** 2).sum(dim=-1).mean()
+                loss = loss + self.config.clogas_cal_lambda * cal_loss
+
+                # L_ent: Negative entropy of CLoGAS gamma (zeroed before ent_start_step)
+                if self.curr_step >= self.config.clogas_ent_start_step:
+                    ent_loss = self.raw_model.clogas_entropy_loss()
+                    loss = loss + self.config.clogas_ent_lambda * ent_loss
+
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
         self.scaler.scale(scaled_loss).backward()
@@ -817,6 +885,11 @@ class Trainer:
             )
             if self.config.use_gateskip_icl:
                 log_gateskip_metrics(
+                    model=self.model,
+                    step=self.curr_step,
+                )
+            if self.config.use_clogas:
+                log_clogas_metrics(
                     model=self.model,
                     step=self.curr_step,
                 )

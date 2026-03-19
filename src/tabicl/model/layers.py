@@ -261,6 +261,7 @@ class MultiheadAttention(nn.MultiheadAttention):
         rope: Optional[RotaryEmbedding] = None,
         attn_gate: Optional[Tensor] = None,
         selective_attn_temp: Optional[Tensor] = None,
+        clogas_bias: Optional[Tensor] = None,
     ) -> Tensor:
         """Compute multi-head attention with support for rotary positional encoding.
 
@@ -299,6 +300,10 @@ class MultiheadAttention(nn.MultiheadAttention):
         selective_attn_temp : Optional[Tensor], default=None
             Query-dependent temperature of shape (..., tgt_len, num_heads).
 
+        clogas_bias : Optional[Tensor], default=None
+            CLoGAS additive attention bias of shape (B, num_heads, tgt_len, n_train).
+            Added to attention logits before softmax. Always <= 0.
+
         Returns
         -------
         Tensor
@@ -325,7 +330,144 @@ class MultiheadAttention(nn.MultiheadAttention):
             rope=rope,
             attn_gate=attn_gate,
             selective_attn_temp=selective_attn_temp,
+            clogas_bias=clogas_bias,
         )
+
+
+class CLoGASGate(nn.Module):
+    """Class-Label-conditioned Gated Attention Softmax (CLoGAS).
+
+    Computes an additive attention bias that conditions each query's attention
+    distribution on the class labels of the key positions. The bias is always
+    <= 0, acting as a soft suppression signal for class-mismatched positions.
+
+    Parameters
+    ----------
+    d_model : int
+        Model hidden dimension.
+
+    nhead : int
+        Number of attention heads.
+
+    max_classes : int
+        Maximum number of class labels.
+    """
+
+    def __init__(self, d_model: int, nhead: int, max_classes: int):
+        super().__init__()
+        self.nhead = nhead
+        self.d_h = d_model // nhead
+        self.max_classes = max_classes
+
+        # Per-head linear class logit projection: q_h @ W_cls → (B, H, n, C)
+        self.W_cls = nn.Parameter(torch.zeros(nhead, self.d_h, max_classes))
+
+        # Per-head MLP correction: d_h → 64 → C with tanh activation
+        self.mlp_fc1 = nn.Parameter(torch.zeros(nhead, self.d_h, 64))
+        self.mlp_b1 = nn.Parameter(torch.zeros(nhead, 64))
+        self.mlp_fc2 = nn.Parameter(torch.zeros(nhead, 64, max_classes))
+        self.mlp_b2 = nn.Parameter(torch.zeros(nhead, max_classes))
+
+        # Temperature from log(n_train): per-head scalar
+        self.w_tau = nn.Parameter(torch.ones(nhead))
+        self.b_tau = nn.Parameter(torch.zeros(nhead))
+
+        # Gating strength: scalar, init 0.0 → no-op at start
+        self.beta = nn.Parameter(torch.tensor(0.0))
+
+        # Observability: snapshots stored only when store_diagnostics=True
+        self.store_diagnostics: bool = False
+        self.last_gamma: Optional[Tensor] = None  # (B, H, T, C)
+        self.last_tau: Optional[Tensor] = None     # (H,)
+        self.last_bias: Optional[Tensor] = None    # (B, H, T, n_train)
+        self.last_g: Optional[Tensor] = None       # (B, H, T, n_train)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Small init for W_cls so logits start near zero
+        nn.init.normal_(self.W_cls, std=0.02)
+        # Xavier-like init for MLP
+        nn.init.normal_(self.mlp_fc1, std=0.02)
+        nn.init.normal_(self.mlp_fc2, std=0.02)
+
+    def forward(self, q_normed: Tensor, y_train: Tensor) -> Tensor:
+        """Compute CLoGAS attention bias.
+
+        Parameters
+        ----------
+        q_normed : Tensor
+            Pre-attention normalized input of shape (B, T, d_model) where T
+            is the full sequence (train + test).
+
+        y_train : Tensor
+            Integer class labels of shape (B, n_train).
+
+        Returns
+        -------
+        Tensor
+            Attention bias of shape (B, H, T, n_train), always <= 0.
+        """
+        B, T, D = q_normed.shape
+        n_train = y_train.shape[1]
+        H = self.nhead
+        d_h = self.d_h
+
+        # Memory guard: (B, H, T, n_train) float32 tensor must fit in GPU memory.
+        # Skip CLoGAS and return None when it would exceed 2 GiB.
+        estimated_bytes = B * H * T * n_train * 4  # float32
+        if estimated_bytes > 2 * (1024 ** 3):
+            return None
+
+        # Reshape to per-head: (B, T, H, d_h) → (B, H, T, d_h)
+        q_h = q_normed.view(B, T, H, d_h).transpose(1, 2)
+
+        # Linear class logits: (B, H, T, C)
+        logit = torch.einsum('bhnd,hdc->bhnc', q_h, self.W_cls)
+
+        # MLP correction: d_h → 64 (tanh) → C
+        h1 = torch.einsum('bhnd,hdf->bhnf', q_h, self.mlp_fc1)
+        h1 = h1 + self.mlp_b1[None, :, None, :]
+        h1 = torch.tanh(h1)
+        mlp_out = torch.einsum('bhnf,hfc->bhnc', h1, self.mlp_fc2)
+        mlp_out = mlp_out + self.mlp_b2[None, :, None, :]
+
+        logit = logit + mlp_out  # (B, H, T, C)
+
+        # Temperature from log(n_train)
+        log_n = torch.log(torch.tensor(float(n_train), device=q_normed.device, dtype=q_normed.dtype))
+        tau_flat = F.softplus(self.w_tau * log_n + self.b_tau)  # (H,)
+        tau = tau_flat.view(1, H, 1, 1)
+
+        # Class distribution
+        gamma = F.softmax(logit / tau, dim=-1)  # (B, H, T, C)
+
+        # Index by y_train labels: gamma[..., y_j] for each train position j.
+        # Use one-hot matmul instead of expand+gather: the stride-0 tensor produced
+        # by expand causes torch.gather to request an impossibly large CUDA allocation.
+        # y_one_hot: (B, n_train, C) — tiny compared to the output
+        y_one_hot = F.one_hot(y_train.long(), self.max_classes).to(gamma.dtype)
+        # (B, H, T, C) @ (B, 1, C, n_train) → (B, H, T, n_train)
+        g = gamma @ y_one_hot.unsqueeze(1).transpose(-1, -2)  # (B, H, T, n_train)
+
+        # Compute bias (always <= 0 when beta >= 0).
+        # During inference, compute in-place on g to avoid allocating a second
+        # (B, H, T, n_train) tensor — cuts CLoGAS peak memory roughly in half.
+        if self.training:
+            bias = self.beta * torch.log(g + 1e-8)
+        else:
+            bias = g.add_(1e-8).log_().mul_(self.beta)
+
+        # Store detached snapshots only when explicitly requested (opt-in)
+        # Storing these every forward pass pins large (B, H, T, n_train) tensors
+        # to GPU memory across all ICL layers, causing OOM on large datasets.
+        if self.store_diagnostics:
+            self.last_gamma = gamma.detach()
+            self.last_tau = tau_flat.detach()
+            self.last_g = g.detach()
+            self.last_bias = bias.detach()
+
+        return bias
 
 
 class GateSkipGate(nn.Module):
@@ -399,6 +541,8 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         use_gated_attn: bool = False,
         use_selective_attn: bool = False,
         use_gateskip: bool = False,
+        use_clogas: bool = False,
+        max_classes: int = 10,
     ):
         super().__init__(d_model, nhead, dim_feedforward, dropout, activation, norm_first=norm_first, batch_first=True)
         del self.self_attn
@@ -419,6 +563,9 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         if use_gateskip:
             self.gateskip_attn = GateSkipGate(d_model)
             self.gateskip_ff = GateSkipGate(d_model)
+        self.use_clogas = use_clogas
+        if use_clogas:
+            self.clogas = CLoGASGate(d_model, nhead, max_classes)
         self.last_gateskip_activations: List[Tensor] = []
         self.init_weights()
 
@@ -443,6 +590,7 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
         rope: Optional[RotaryEmbedding] = None,
+        y_train: Optional[Tensor] = None,
     ) -> Tensor:
         """Process input through attention with optional rotary positional encoding.
 
@@ -475,6 +623,10 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
 
         rope : Optional[RotaryEmbedding]
             Rotary positional encoding
+
+        y_train : Optional[Tensor], default=None
+            Integer class labels of shape (B, n_train). Required when CLoGAS is
+            enabled; ignored otherwise.
 
         Returns
         -------
@@ -517,7 +669,8 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
             v_normed = self.norm1(v)
             gate = torch.sigmoid(self.gate_proj(q_normed)) if self.use_gated_attn else None
             temp = (1 + torch.tanh(self.temp_mlp(q_normed))) if self.use_selective_attn else None
-            attn_out = self._attn_block(q_normed, k_normed, v_normed, key_padding_mask, attn_mask, rope, gate, temp)
+            clogas_bias = self.clogas(q_normed, y_train) if self.use_clogas and y_train is not None else None
+            attn_out = self._attn_block(q_normed, k_normed, v_normed, key_padding_mask, attn_mask, rope, gate, temp, clogas_bias)
             if self.use_gateskip:
                 gs_attn = self.gateskip_attn(x)
                 self.last_gateskip_activations.append(gs_attn)
@@ -533,7 +686,8 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
             # Post-norm: normalize after attention and FFN
             gate = torch.sigmoid(self.gate_proj(q)) if self.use_gated_attn else None
             temp = (1 + torch.tanh(self.temp_mlp(q))) if self.use_selective_attn else None
-            attn_out = self._attn_block(q, k, v, key_padding_mask, attn_mask, rope, gate, temp)
+            clogas_bias = self.clogas(q, y_train) if self.use_clogas and y_train is not None else None
+            attn_out = self._attn_block(q, k, v, key_padding_mask, attn_mask, rope, gate, temp, clogas_bias)
             if self.use_gateskip:
                 gs_attn = self.gateskip_attn(x)
                 self.last_gateskip_activations.append(gs_attn)
@@ -558,8 +712,9 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         rope: Optional[RotaryEmbedding],
         attn_gate: Optional[Tensor] = None,
         selective_attn_temp: Optional[Tensor] = None,
+        clogas_bias: Optional[Tensor] = None,
     ) -> Tensor:
-        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope, attn_gate=attn_gate, selective_attn_temp=selective_attn_temp)
+        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope, attn_gate=attn_gate, selective_attn_temp=selective_attn_temp, clogas_bias=clogas_bias)
         return self.dropout1(attn)
 
     def _ff_block(self, x: Tensor) -> Tensor:

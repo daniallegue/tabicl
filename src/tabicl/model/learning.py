@@ -271,12 +271,14 @@ class ICLearning(nn.Module):
         use_gated_attn: bool = False,
         use_selective_attn: bool = False,
         use_gateskip_icl: bool = False,
+        use_clogas: bool = False,
     ):
         super().__init__()
         self.max_classes = max_classes
         self.norm_first = norm_first
         self.use_moe_icl = use_moe_icl
         self.use_gateskip_icl = use_gateskip_icl
+        self.use_clogas = use_clogas
 
         self.tf_icl = Encoder(
             num_blocks=num_blocks,
@@ -289,6 +291,8 @@ class ICLearning(nn.Module):
             use_gated_attn=use_gated_attn,
             use_selective_attn=use_selective_attn,
             use_gateskip=use_gateskip_icl,
+            use_clogas=use_clogas,
+            max_classes=max_classes,
         )
 
         if norm_first:
@@ -319,7 +323,8 @@ class ICLearning(nn.Module):
         train_size = y_train.shape[1]
         R[:, :train_size] += self.y_encoder(y_train.float())
 
-        src = self.tf_icl(R, attn_mask=train_size)
+        clogas_y = y_train if self.use_clogas else None
+        src = self.tf_icl(R, attn_mask=train_size, y_train=clogas_y)
         if self.norm_first:
             src = self.ln(src)
 
@@ -468,6 +473,27 @@ class ICLearning(nn.Module):
             return torch.tensor(0.0, device=next(self.parameters()).device)
         all_acts = torch.cat([a.flatten() for a in activations])
         return (all_acts ** 2).mean()
+
+    def clogas_entropy_loss(self) -> torch.Tensor:
+        """Compute negative mean entropy of CLoGAS gamma distributions.
+
+        Minimizing this loss maximizes entropy of the class distributions,
+        encouraging diverse attention patterns.
+
+        Returns
+        -------
+        Tensor
+            Scalar entropy loss (negative entropy, so minimize to maximize entropy).
+        """
+        gammas = self.tf_icl.get_clogas_gammas()
+        if not gammas:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        # gamma: (B, H, T, C) per layer; compute -H(gamma) = sum(gamma * log(gamma))
+        ent_losses = []
+        for gamma in gammas:
+            ent = (gamma * torch.log(gamma + 1e-8)).sum(dim=-1)  # (B, H, T)
+            ent_losses.append(ent.mean())
+        return torch.stack(ent_losses).mean()
 
     def get_moe_blocks(self):
         return [self.moe_block] if self.moe_block is not None else []

@@ -73,6 +73,7 @@ def multi_head_attention_forward(
     rope: Optional[RotaryEmbedding] = None,
     attn_gate: Optional[Tensor] = None,
     selective_attn_temp: Optional[Tensor] = None,
+    clogas_bias: Optional[Tensor] = None,
 ) -> Tensor:
     """Multi-head attention with support for rotary position embeddings
     as well as specialized processing when attn_mask is an integer.
@@ -183,7 +184,9 @@ def multi_head_attention_forward(
         k_left = k[..., :cut_pos, :]
         v_left = v[..., :cut_pos, :]
 
-        attn_left = sdpa_with_flattened_batch(q_left, k_left, v_left, dropout_p=dropout_p)
+        # CLoGAS bias for train→train: (batch_shape, nh, cut_pos, cut_pos)
+        left_mask = clogas_bias[..., :cut_pos, :] if clogas_bias is not None else None
+        attn_left = sdpa_with_flattened_batch(q_left, k_left, v_left, attn_mask=left_mask, dropout_p=dropout_p)
         attn_left = attn_left.transpose(-3, -2).contiguous().view(*batch_shape, cut_pos, embed_dim)
         if attn_gate is not None:
             attn_left = attn_left * attn_gate[..., :cut_pos, :]
@@ -192,7 +195,9 @@ def multi_head_attention_forward(
         # Process right segment (tokens after cut_pos attending to tokens before cut_pos)
         if cut_pos < tgt_len:
             q_right = q[..., cut_pos:, :]  # (batch_shape, nh, tgt_len - cut_pos, hs)
-            attn_right = sdpa_with_flattened_batch(q_right, k_left, v_left, dropout_p=dropout_p)
+            # CLoGAS bias for test→train: (batch_shape, nh, tgt_len - cut_pos, cut_pos)
+            right_mask = clogas_bias[..., cut_pos:, :] if clogas_bias is not None else None
+            attn_right = sdpa_with_flattened_batch(q_right, k_left, v_left, attn_mask=right_mask, dropout_p=dropout_p)
             attn_right = attn_right.transpose(-3, -2).contiguous().view(*batch_shape, tgt_len - cut_pos, embed_dim)
             if attn_gate is not None:
                 attn_right = attn_right * attn_gate[..., cut_pos:, :]

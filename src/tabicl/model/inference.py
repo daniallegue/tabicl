@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import warnings
 import itertools
 from collections import OrderedDict
@@ -446,7 +447,7 @@ class InferenceManager:
                     f"Offloading to CPU: {self.offload}"
                 )
 
-        # If we can process all data in one batch, do it
+        # If we can process all data in one batch, try to do it
         if batch_size >= total_bs:
             # Move inputs to execution device
             inputs_on_exe = {}
@@ -456,18 +457,30 @@ class InferenceManager:
                 else:
                     inputs_on_exe[name] = value
 
-            with torch.no_grad():
-                if self.use_amp and self.exe_device.type == "cuda":
-                    with torch.autocast(device_type="cuda"):
+            try:
+                with torch.no_grad():
+                    if self.use_amp and self.exe_device.type == "cuda":
+                        with torch.autocast(device_type="cuda"):
+                            outputs = forward_fn(**inputs_on_exe)
+                    else:
                         outputs = forward_fn(**inputs_on_exe)
-                else:
-                    outputs = forward_fn(**inputs_on_exe)
 
-            # Move to CPU if needed
-            if self.offload:
-                return outputs.to(device="cpu")
-            else:
-                return outputs
+                # Move to CPU if needed
+                if self.offload:
+                    return outputs.to(device="cpu")
+                else:
+                    return outputs
+
+            except torch.cuda.OutOfMemoryError:
+                # Memory estimator didn't account for all allocations (e.g. CLoGAS
+                # attention bias). Explicitly free GPU tensors from the failed attempt,
+                # force Python GC to collect any reference cycles, then fall through to
+                # the iterative path so the OOM-recovery loop below can handle it.
+                del inputs_on_exe
+                gc.collect()
+                if self.exe_device.type == "cuda":
+                    torch.cuda.empty_cache()
+                batch_size = max(self.min_batch_size, total_bs // 2)
 
         # Pre-allocate output tensor with same dtype as input
         output_device = torch.device("cpu") if self.offload else self.exe_device
@@ -519,7 +532,9 @@ class InferenceManager:
                         f"reducing to {max(self.min_batch_size, batch_size // 2)}"
                     )
 
-                # Clear CUDA memory and reduce batch size
+                # Free the failed batch, collect reference cycles, then clear CUDA cache
+                del batch_dict
+                gc.collect()
                 if self.exe_device.type == "cuda":
                     torch.cuda.empty_cache()
 

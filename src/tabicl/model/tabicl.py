@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional, List, Callable
+import torch
 from torch import nn, Tensor, cat
 
 from .embedding import ColEmbedding
@@ -97,6 +98,7 @@ class TabICL(nn.Module):
         use_gated_attn: bool = False,
         use_selective_attn: bool = False,
         use_gateskip_icl: bool = False,
+        use_clogas: bool = False,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -162,6 +164,7 @@ class TabICL(nn.Module):
             use_gated_attn=use_gated_attn,
             use_selective_attn=use_selective_attn,
             use_gateskip_icl=use_gateskip_icl,
+            use_clogas=use_clogas,
         )
 
     def _train_forward(
@@ -401,6 +404,59 @@ class TabICL(nn.Module):
     def gateskip_sparsity_loss(self):
         """Compute GateSkip L2 sparsity loss from ICL layers."""
         return self.icl_predictor.gateskip_sparsity_loss()
+
+    def clogas_entropy_loss(self):
+        """Compute CLoGAS entropy loss from ICL layers."""
+        return self.icl_predictor.clogas_entropy_loss()
+
+    def enable_clogas_diagnostics(self):
+        """Enable diagnostic snapshot storage in all CLoGAS gates.
+
+        Must be called before a forward pass whose diagnostics you want to inspect.
+        Snapshots pin large (B, H, T, n_train) tensors to GPU — call
+        disable_clogas_diagnostics() when done to free that memory.
+        """
+        for block in self.icl_predictor.tf_icl.blocks:
+            if block.use_clogas:
+                block.clogas.store_diagnostics = True
+
+    def disable_clogas_diagnostics(self):
+        """Disable diagnostic snapshot storage and free cached tensors."""
+        for block in self.icl_predictor.tf_icl.blocks:
+            if block.use_clogas:
+                c = block.clogas
+                c.store_diagnostics = False
+                c.last_gamma = None
+                c.last_tau = None
+                c.last_g = None
+                c.last_bias = None
+
+    @torch.no_grad()
+    def get_clogas_diagnostics(self):
+        """Return CLoGAS diagnostics stored during the last forward pass.
+
+        Requires enable_clogas_diagnostics() to have been called before the
+        forward pass. Returns a list of dicts (one per ICL block with CLoGAS
+        enabled), each containing detached tensors:
+          - beta: scalar gating strength
+          - tau: (H,) per-head temperature
+          - gamma: (B, H, T, C) class distribution
+          - g: (B, H, T, n_train) gate values (gamma indexed at y_train)
+          - bias: (B, H, T, n_train) additive attention bias
+        """
+        diagnostics = []
+        for block in self.icl_predictor.tf_icl.blocks:
+            if not block.use_clogas:
+                continue
+            c = block.clogas
+            diagnostics.append({
+                "beta": c.beta.detach(),
+                "tau": c.last_tau,
+                "gamma": c.last_gamma,
+                "g": c.last_g,
+                "bias": c.last_bias,
+            })
+        return diagnostics
 
     def get_moe_blocks(self):
         """Returns MoE blocks from the ICL predictor for observability."""

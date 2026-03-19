@@ -195,6 +195,10 @@ def build_parser():
     parser.add_argument("--use_selective_attn", action="store_true", help="Enable selective attention (query-dependent temperature) in TF_Col and TF_ICL layers (not TF_Row)")
     parser.add_argument("--use_gateskip_icl", action="store_true", help="Enable GateSkip residual gating in ICL transformer layers")
     parser.add_argument("--gateskip_lambda", type=float, default=0.1, help="Sparsity loss weight (lambda_S) for GateSkip gates")
+    parser.add_argument("--use_clogas", action="store_true", help="Enable CLoGAS (Class-Label-conditioned Gated Attention Softmax) in ICL transformer layers")
+    parser.add_argument("--clogas_cal_lambda", type=float, default=0.1, help="Weight for calibration loss (L_cal) when CLoGAS is enabled")
+    parser.add_argument("--clogas_ent_lambda", type=float, default=0.01, help="Weight for entropy loss (L_ent) when CLoGAS is enabled")
+    parser.add_argument("--clogas_ent_start_step", type=int, default=50000, help="Step at which to start applying L_ent (zeroed before this step)")
 
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")

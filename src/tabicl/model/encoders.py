@@ -55,6 +55,8 @@ class Encoder(nn.Module):
         use_gated_attn: bool = False,
         use_selective_attn: bool = False,
         use_gateskip: bool = False,
+        use_clogas: bool = False,
+        max_classes: int = 10,
     ):
         super().__init__()
 
@@ -73,6 +75,8 @@ class Encoder(nn.Module):
                     use_gated_attn=use_gated_attn,
                     use_selective_attn=use_selective_attn,
                     use_gateskip=use_gateskip,
+                    use_clogas=use_clogas,
+                    max_classes=max_classes,
                 )
                 for _ in range(num_blocks)
             ]
@@ -85,6 +89,7 @@ class Encoder(nn.Module):
         src: Tensor,
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
+        y_train: Optional[Tensor] = None,
     ) -> Tensor:
         """Process input through the stacked blocks.
 
@@ -107,6 +112,10 @@ class Encoder(nn.Module):
               - The first `attn_mask` tokens perform self-attention only (attend to themselves)
               - The remaining tokens attend only to the first `attn_mask` tokens
 
+        y_train : Optional[Tensor], default=None
+            Integer class labels of shape (B, n_train). Passed to blocks for
+            CLoGAS bias computation when enabled.
+
         Returns
         -------
         Tensor
@@ -114,7 +123,7 @@ class Encoder(nn.Module):
         """
         out = src
         for block in self.blocks:
-            out = block(q=out, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=self.rope)
+            out = block(q=out, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=self.rope, y_train=y_train)
 
         return out
 
@@ -130,6 +139,20 @@ class Encoder(nn.Module):
         for block in self.blocks:
             activations.extend(block.last_gateskip_activations)
         return activations
+
+    def get_clogas_gammas(self):
+        """Collect CLoGAS gamma distributions from the last forward pass.
+
+        Returns
+        -------
+        list[Tensor]
+            List of gamma tensors of shape (B, H, T, C), one per block.
+        """
+        gammas = []
+        for block in self.blocks:
+            if block.use_clogas and block.clogas.last_gamma is not None:
+                gammas.append(block.clogas.last_gamma)
+        return gammas
 
 class SetTransformer(nn.Module):
     """Stack of induced self-attention blocks.
