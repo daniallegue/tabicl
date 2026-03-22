@@ -121,12 +121,13 @@ def log_gateskip_metrics(model, step: int):
 @torch.no_grad()
 def log_clogas_metrics(model, step: int):
     """
-    Logs CLoGAS observability metrics to wandb.
+    Logs CLoGAS v2 observability metrics to wandb.
 
-    Per block per head:
-      - beta: gating strength (shared across heads)
-      - tau: per-head temperature
-      - gamma_entropy: mean entropy of the class distribution
+    Per block (gate is shared across heads in v2):
+      - beta: gating strength
+      - tau_eff: effective temperature (post-annealing)
+      - tau_learned: exp(log_tau), the purely learned component
+      - gamma_entropy: mean entropy of the class distribution (all tokens)
       - mean_bias: mean additive bias (should be <= 0)
       - mean_g: mean gate value (gamma indexed at y_train)
     """
@@ -141,32 +142,26 @@ def log_clogas_metrics(model, step: int):
         clogas = block.clogas
         prefix = f"clogas/block_{block_idx}"
 
-        # beta — scalar gating strength
+        # Scalar gating strength and temperature
         metrics[f"{prefix}/beta"] = clogas.beta.item()
-
-        # Per-head temperature
+        metrics[f"{prefix}/tau_learned"] = clogas.log_tau.exp().item()
         if clogas.last_tau is not None:
-            for h in range(clogas.nhead):
-                metrics[f"{prefix}/head_{h}/tau"] = clogas.last_tau[h].item()
+            metrics[f"{prefix}/tau_eff"] = clogas.last_tau.item()
 
-        # Gamma entropy per head: H(gamma) = -sum(gamma * log(gamma))
+        # Gamma entropy: H(gamma) = -sum(gamma * log(gamma)) over class dim
+        # gamma shape: (B, T, C)
         if clogas.last_gamma is not None:
             gamma = clogas.last_gamma.detach()
-            ent = -(gamma * torch.log(gamma + 1e-8)).sum(dim=-1)  # (B, H, T)
-            for h in range(clogas.nhead):
-                metrics[f"{prefix}/head_{h}/gamma_entropy"] = ent[:, h].mean().item()
+            ent = -(gamma * torch.log(gamma + 1e-8)).sum(dim=-1)  # (B, T)
+            metrics[f"{prefix}/gamma_entropy"] = ent.mean().item()
 
-        # Mean bias per head (should be <= 0)
+        # Mean bias (should be <= 0); shape: (B, 1, T, n_train)
         if clogas.last_bias is not None:
-            bias = clogas.last_bias
-            for h in range(clogas.nhead):
-                metrics[f"{prefix}/head_{h}/mean_bias"] = bias[:, h].mean().item()
+            metrics[f"{prefix}/mean_bias"] = clogas.last_bias.mean().item()
 
-        # Mean gate value per head (gamma[y_j])
+        # Mean gate value; shape: (B, T, n_train)
         if clogas.last_g is not None:
-            g = clogas.last_g
-            for h in range(clogas.nhead):
-                metrics[f"{prefix}/head_{h}/mean_g"] = g[:, h].mean().item()
+            metrics[f"{prefix}/mean_g"] = clogas.last_g.mean().item()
 
     if metrics:
         wandb.log(metrics, step=step)
@@ -791,12 +786,15 @@ class Trainer:
                 gateskip_loss = self.raw_model.gateskip_sparsity_loss()
                 loss = loss + self.config.gateskip_lambda * gateskip_loss
 
-            # Adds CLoGAS losses: L_cal (calibration) + L_ent (entropy)
+            # Adds CLoGAS losses: L_cal (focal CE on gate) + L_ent (entropy)
             if self.config.use_clogas:
-                # L_cal: Brier score — penalizes miscalibrated probabilities
-                probs = F.softmax(pred, dim=-1)
-                true_onehot = F.one_hot(true, num_classes=self.config.max_classes).float()
-                cal_loss = ((probs - true_onehot) ** 2).sum(dim=-1).mean()
+                # Advance global_step in all CLoGAS gates for tau annealing
+                for block in self.raw_model.icl_predictor.tf_icl.blocks:
+                    if block.use_clogas:
+                        block.clogas.global_step.fill_(self.curr_step)
+
+                # L_cal: focal CE on gate gamma (blocks >= 4, test tokens only)
+                cal_loss = self.raw_model.clogas_cal_loss(true)
                 loss = loss + self.config.clogas_cal_lambda * cal_loss
 
                 # L_ent: Negative entropy of CLoGAS gamma (zeroed before ent_start_step)

@@ -409,6 +409,10 @@ class TabICL(nn.Module):
         """Compute CLoGAS entropy loss from ICL layers."""
         return self.icl_predictor.clogas_entropy_loss()
 
+    def clogas_cal_loss(self, y_true: torch.Tensor):
+        """Compute CLoGAS focal-CE calibration loss for blocks >= 4."""
+        return self.icl_predictor.clogas_cal_loss(y_true)
+
     def enable_clogas_diagnostics(self):
         """Enable diagnostic snapshot storage in all CLoGAS gates.
 
@@ -438,20 +442,26 @@ class TabICL(nn.Module):
         Requires enable_clogas_diagnostics() to have been called before the
         forward pass. Returns a list of dicts (one per ICL block with CLoGAS
         enabled), each containing detached tensors:
+          - block_idx: integer layer index
           - beta: scalar gating strength
-          - tau: (H,) per-head temperature
-          - gamma: (B, H, T, C) class distribution
-          - g: (B, H, T, n_train) gate values (gamma indexed at y_train)
-          - bias: (B, H, T, n_train) additive attention bias
+          - tau: scalar effective temperature (post-annealing)
+          - tau_learned: scalar exp(log_tau) learned component
+          - global_step: current step used for annealing
+          - gamma: (B, T, C) class distribution (shared across heads)
+          - g: (B, T, n_train) gate values (gamma indexed at y_train)
+          - bias: (B, 1, T, n_train) additive attention bias (broadcast over heads)
         """
         diagnostics = []
-        for block in self.icl_predictor.tf_icl.blocks:
+        for block_idx, block in enumerate(self.icl_predictor.tf_icl.blocks):
             if not block.use_clogas:
                 continue
             c = block.clogas
             diagnostics.append({
+                "block_idx": block_idx,
                 "beta": c.beta.detach(),
                 "tau": c.last_tau,
+                "tau_learned": c.log_tau.exp().detach(),
+                "global_step": c.global_step.item(),
                 "gamma": c.last_gamma,
                 "g": c.last_g,
                 "bias": c.last_bias,

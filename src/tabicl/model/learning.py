@@ -321,6 +321,7 @@ class ICLearning(nn.Module):
 
     def _icl_predictions(self, R: Tensor, y_train: Tensor, column_context: Tensor | None = None):
         train_size = y_train.shape[1]
+        self._last_train_size = train_size  # stored for clogas_cal_loss
         R[:, :train_size] += self.y_encoder(y_train.float())
 
         clogas_y = y_train if self.use_clogas else None
@@ -488,12 +489,52 @@ class ICLearning(nn.Module):
         gammas = self.tf_icl.get_clogas_gammas()
         if not gammas:
             return torch.tensor(0.0, device=next(self.parameters()).device)
-        # gamma: (B, H, T, C) per layer; compute -H(gamma) = sum(gamma * log(gamma))
+        # gamma: (B, T, C) per layer (v2: no head dimension)
         ent_losses = []
         for gamma in gammas:
-            ent = (gamma * torch.log(gamma + 1e-8)).sum(dim=-1)  # (B, H, T)
+            ent = (gamma * torch.log(gamma + 1e-8)).sum(dim=-1)  # (B, T)
             ent_losses.append(ent.mean())
         return torch.stack(ent_losses).mean()
+
+    def clogas_cal_loss(self, y_true: torch.Tensor) -> torch.Tensor:
+        """Focal cross-entropy calibration loss on the CLoGAS gate.
+
+        Computed only on test-token gammas from blocks at index >= 4.
+
+        Parameters
+        ----------
+        y_true : Tensor
+            Ground-truth class labels for test tokens, shape (B * n_test,).
+
+        Returns
+        -------
+        Tensor
+            Scalar focal-CE loss: mean_{l>=4} -(1 - p_t)^2 * log(p_t).
+        """
+        n_train = getattr(self, '_last_train_size', None)
+        if n_train is None:
+            return torch.tensor(0.0, device=y_true.device)
+
+        cal_losses = []
+        for block_idx, block in enumerate(self.tf_icl.blocks):
+            if block_idx < 4:
+                continue
+            if not block.use_clogas or block.clogas.last_gamma is None:
+                continue
+
+            gamma = block.clogas.last_gamma  # (B, T, C)
+            B = gamma.shape[0]
+            gamma_test = gamma[:, n_train:, :]  # (B, n_test, C)
+            n_test = gamma_test.shape[1]
+            gamma_flat = gamma_test.reshape(B * n_test, -1)  # (B*n_test, C)
+
+            p_t = gamma_flat[torch.arange(B * n_test, device=y_true.device), y_true]
+            focal = -((1 - p_t) ** 2) * torch.log(p_t + 1e-8)
+            cal_losses.append(focal.mean())
+
+        if not cal_losses:
+            return torch.tensor(0.0, device=y_true.device)
+        return torch.stack(cal_losses).mean()
 
     def get_moe_blocks(self):
         return [self.moe_block] if self.moe_block is not None else []

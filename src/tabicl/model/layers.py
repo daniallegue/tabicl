@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from typing import List, Optional
 
 import torch
@@ -335,68 +336,89 @@ class MultiheadAttention(nn.MultiheadAttention):
 
 
 class CLoGASGate(nn.Module):
-    """Class-Label-conditioned Gated Attention Softmax (CLoGAS).
+    """Class-Label-conditioned Gated Attention Softmax v2 (CLoGAS).
 
     Computes an additive attention bias that conditions each query's attention
-    distribution on the class labels of the key positions. The bias is always
-    <= 0, acting as a soft suppression signal for class-mismatched positions.
+    distribution on the class labels of the key positions.  The gate is derived
+    from geometric similarity to per-class prototypes (computed on-the-fly from
+    the current layer's training representations) plus a learned residual
+    correction.  The bias is always <= 0, acting as a soft suppression signal
+    for class-mismatched positions and is shared across all attention heads.
+
+    Gate computation (per-layer, not per-head)
+    ------------------------------------------
+    1. proto_c  = mean_{j: y_j == c}( x_j^(l) )              (C, d)
+    2. sim_c    = (x_t^(l) @ proto_c.T) / sqrt(d)             (T, C)
+    3. correction = x_t^(l) @ W_cls                            (T, C)
+    4. gamma_t  = softmax( (sim_c + correction) / tau_eff )    (T, C)
+    5. g_tj     = gamma_t[ y_j ]                               scalar per training token
+    6. bias_tj  = beta * log(g_tj + eps)                       <= 0
+
+    Temperature annealing
+    ---------------------
+    tau_eff = max(exp(log_tau), linear_anneal(TAU_INIT → TAU_FINAL, 0 → TAU_ANNEAL_STEPS))
 
     Parameters
     ----------
     d_model : int
         Model hidden dimension.
 
-    nhead : int
-        Number of attention heads.
-
     max_classes : int
         Maximum number of class labels.
     """
 
-    def __init__(self, d_model: int, nhead: int, max_classes: int):
+    TAU_ANNEAL_INIT: float = 5.0
+    TAU_ANNEAL_FINAL: float = 1.0
+    TAU_ANNEAL_STEPS: int = 5000
+
+    def __init__(self, d_model: int, max_classes: int):
         super().__init__()
-        self.nhead = nhead
-        self.d_h = d_model // nhead
+        self.d_model = d_model
         self.max_classes = max_classes
 
-        # Per-head linear class logit projection: q_h @ W_cls → (B, H, n, C)
-        self.W_cls = nn.Parameter(torch.zeros(nhead, self.d_h, max_classes))
+        # Residual correction on top of prototype similarity: x @ W_cls → (B, T, C)
+        self.W_cls = nn.Parameter(torch.zeros(d_model, max_classes))
 
-        # Per-head MLP correction: d_h → 64 → C with tanh activation
-        self.mlp_fc1 = nn.Parameter(torch.zeros(nhead, self.d_h, 64))
-        self.mlp_b1 = nn.Parameter(torch.zeros(nhead, 64))
-        self.mlp_fc2 = nn.Parameter(torch.zeros(nhead, 64, max_classes))
-        self.mlp_b2 = nn.Parameter(torch.zeros(nhead, max_classes))
-
-        # Temperature from log(n_train): per-head scalar
-        self.w_tau = nn.Parameter(torch.ones(nhead))
-        self.b_tau = nn.Parameter(torch.zeros(nhead))
+        # Learned log-temperature (scalar per layer); exp() ensures tau > 0.
+        # Initialised at log(TAU_ANNEAL_INIT) so it matches the start of the schedule.
+        self.log_tau = nn.Parameter(torch.tensor(math.log(self.TAU_ANNEAL_INIT)))
 
         # Gating strength: scalar, init 0.0 → no-op at start
         self.beta = nn.Parameter(torch.tensor(0.0))
 
+        # Global step counter (written by the Trainer) used for tau annealing.
+        self.register_buffer('global_step', torch.tensor(0, dtype=torch.long))
+
         # Observability: snapshots stored only when store_diagnostics=True
         self.store_diagnostics: bool = False
-        self.last_gamma: Optional[Tensor] = None  # (B, H, T, C)
-        self.last_tau: Optional[Tensor] = None     # (H,)
-        self.last_bias: Optional[Tensor] = None    # (B, H, T, n_train)
-        self.last_g: Optional[Tensor] = None       # (B, H, T, n_train)
+        self.last_gamma: Optional[Tensor] = None  # (B, T, C)
+        self.last_tau: Optional[Tensor] = None    # scalar tensor
+        self.last_bias: Optional[Tensor] = None   # (B, 1, T, n_train)
+        self.last_g: Optional[Tensor] = None      # (B, T, n_train)
 
         self._init_weights()
 
     def _init_weights(self):
-        # Small init for W_cls so logits start near zero
         nn.init.normal_(self.W_cls, std=0.02)
-        # Xavier-like init for MLP
-        nn.init.normal_(self.mlp_fc1, std=0.02)
-        nn.init.normal_(self.mlp_fc2, std=0.02)
 
-    def forward(self, q_normed: Tensor, y_train: Tensor) -> Tensor:
+    def _tau_eff(self) -> Tensor:
+        """Effective temperature: max of learned value and annealing schedule."""
+        tau_learned = self.log_tau.exp()
+        step = int(self.global_step.item())
+        if step < self.TAU_ANNEAL_STEPS:
+            frac = step / self.TAU_ANNEAL_STEPS
+            tau_sched = self.TAU_ANNEAL_INIT + frac * (self.TAU_ANNEAL_FINAL - self.TAU_ANNEAL_INIT)
+        else:
+            tau_sched = self.TAU_ANNEAL_FINAL
+        tau_sched_t = tau_learned.new_tensor(tau_sched)
+        return torch.max(tau_learned, tau_sched_t)
+
+    def forward(self, x_normed: Tensor, y_train: Tensor) -> Optional[Tensor]:
         """Compute CLoGAS attention bias.
 
         Parameters
         ----------
-        q_normed : Tensor
+        x_normed : Tensor
             Pre-attention normalized input of shape (B, T, d_model) where T
             is the full sequence (train + test).
 
@@ -405,65 +427,58 @@ class CLoGASGate(nn.Module):
 
         Returns
         -------
-        Tensor
-            Attention bias of shape (B, H, T, n_train), always <= 0.
+        Tensor or None
+            Attention bias of shape (B, 1, T, n_train), always <= 0.
+            Broadcast dimension 1 is shared across all attention heads.
+            Returns None when the bias tensor would exceed the memory budget.
         """
-        B, T, D = q_normed.shape
+        B, T, D = x_normed.shape
         n_train = y_train.shape[1]
-        H = self.nhead
-        d_h = self.d_h
+        C = self.max_classes
 
-        # Memory guard: (B, H, T, n_train) float32 tensor must fit in GPU memory.
-        # Skip CLoGAS and return None when it would exceed 2 GiB.
-        estimated_bytes = B * H * T * n_train * 4  # float32
+        # Memory guard: (B, T, n_train) float32 tensor must fit in GPU memory.
+        estimated_bytes = B * T * n_train * 4  # float32
         if estimated_bytes > 2 * (1024 ** 3):
             return None
 
-        # Reshape to per-head: (B, T, H, d_h) → (B, H, T, d_h)
-        q_h = q_normed.view(B, T, H, d_h).transpose(1, 2)
+        # One-hot encoding for prototype computation and label indexing
+        y_one_hot = F.one_hot(y_train.long(), C).to(x_normed.dtype)  # (B, n_train, C)
 
-        # Linear class logits: (B, H, T, C)
-        logit = torch.einsum('bhnd,hdc->bhnc', q_h, self.W_cls)
+        # Step 1: Per-class prototype from training tokens at this layer
+        x_train = x_normed[:, :n_train]  # (B, n_train, D)
+        counts = y_one_hot.sum(dim=1).clamp(min=1)  # (B, C)
+        # proto_c: (B, C, D)
+        proto_c = torch.einsum('bnc,bnd->bcd', y_one_hot, x_train) / counts.unsqueeze(-1)
 
-        # MLP correction: d_h → 64 (tanh) → C
-        h1 = torch.einsum('bhnd,hdf->bhnf', q_h, self.mlp_fc1)
-        h1 = h1 + self.mlp_b1[None, :, None, :]
-        h1 = torch.tanh(h1)
-        mlp_out = torch.einsum('bhnf,hfc->bhnc', h1, self.mlp_fc2)
-        mlp_out = mlp_out + self.mlp_b2[None, :, None, :]
+        # Step 2: Geometric similarity of every token to each prototype
+        sim_c = torch.einsum('btd,bcd->btc', x_normed, proto_c) / math.sqrt(D)  # (B, T, C)
 
-        logit = logit + mlp_out  # (B, H, T, C)
+        # Step 3: Learned residual correction
+        correction = x_normed @ self.W_cls  # (B, T, C)
 
-        # Temperature from log(n_train)
-        log_n = torch.log(torch.tensor(float(n_train), device=q_normed.device, dtype=q_normed.dtype))
-        tau_flat = F.softplus(self.w_tau * log_n + self.b_tau)  # (H,)
-        tau = tau_flat.view(1, H, 1, 1)
+        # Step 4: Effective temperature with annealing
+        tau = self._tau_eff()  # scalar
 
-        # Class distribution
-        gamma = F.softmax(logit / tau, dim=-1)  # (B, H, T, C)
+        # Gate distribution
+        gamma = F.softmax((sim_c + correction) / tau, dim=-1)  # (B, T, C)
 
-        # Index by y_train labels: gamma[..., y_j] for each train position j.
-        # Use one-hot matmul instead of expand+gather: the stride-0 tensor produced
-        # by expand causes torch.gather to request an impossibly large CUDA allocation.
-        # y_one_hot: (B, n_train, C) — tiny compared to the output
-        y_one_hot = F.one_hot(y_train.long(), self.max_classes).to(gamma.dtype)
-        # (B, H, T, C) @ (B, 1, C, n_train) → (B, H, T, n_train)
-        g = gamma @ y_one_hot.unsqueeze(1).transpose(-1, -2)  # (B, H, T, n_train)
+        # Step 5: Index gate by training labels: g_tj = gamma_t[y_j]
+        # (B, T, C) @ (B, C, n_train) → (B, T, n_train)
+        g = gamma @ y_one_hot.transpose(1, 2)  # (B, T, n_train)
 
-        # Compute bias (always <= 0 when beta >= 0).
-        # During inference, compute in-place on g to avoid allocating a second
-        # (B, H, T, n_train) tensor — cuts CLoGAS peak memory roughly in half.
+        # Step 6: Bias (always <= 0 when beta >= 0).
+        # At inference compute in-place to halve peak memory.
         if self.training:
             bias = self.beta * torch.log(g + 1e-8)
         else:
             bias = g.add_(1e-8).log_().mul_(self.beta)
 
-        # Store detached snapshots only when explicitly requested (opt-in)
-        # Storing these every forward pass pins large (B, H, T, n_train) tensors
-        # to GPU memory across all ICL layers, causing OOM on large datasets.
+        # Expand for broadcasting over attention heads: (B, 1, T, n_train)
+        bias = bias.unsqueeze(1)
+
         if self.store_diagnostics:
             self.last_gamma = gamma.detach()
-            self.last_tau = tau_flat.detach()
+            self.last_tau = tau.detach()
             self.last_g = g.detach()
             self.last_bias = bias.detach()
 
@@ -565,7 +580,7 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
             self.gateskip_ff = GateSkipGate(d_model)
         self.use_clogas = use_clogas
         if use_clogas:
-            self.clogas = CLoGASGate(d_model, nhead, max_classes)
+            self.clogas = CLoGASGate(d_model, max_classes)
         self.last_gateskip_activations: List[Tensor] = []
         self.init_weights()
 
